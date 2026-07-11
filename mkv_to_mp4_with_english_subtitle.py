@@ -64,9 +64,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="允许覆盖已有的输出 MP4；保留字幕时也允许覆盖同名字幕",
     )
     parser.add_argument(
-        "--keep-subtitle",
+        "--temporary-subtitle",
         action="store_true",
-        help="将提取的字幕保留在 MKV 同目录；默认仅作为临时文件使用",
+        help="仅将提取字幕作为临时文件使用，并在流程结束后删除",
     )
     parser.add_argument(
         "--keep-media-temp",
@@ -112,16 +112,16 @@ def select_english_subtitle(mkv: Path) -> dict:
 def prepare_subtitle_output(
     mkv: Path,
     track: dict,
-    keep_subtitle: bool,
+    temporary_subtitle: bool,
     overwrite: bool,
 ) -> tuple[Path, list[Path]]:
     source_output = extract.get_output_path(mkv, track)
-    if keep_subtitle:
-        subtitle_output = source_output
-    else:
+    if temporary_subtitle:
         burn.TEMP_DIR.mkdir(parents=True, exist_ok=True)
         temp_id = f"mkv_english_subtitle_{os.getpid()}_{uuid.uuid4().hex[:8]}"
         subtitle_output = burn.TEMP_DIR / f"{temp_id}{source_output.suffix}"
+    else:
+        subtitle_output = source_output
 
     related_outputs = extract.get_related_outputs(subtitle_output, track)
     existing = [path for path in related_outputs if path.exists()]
@@ -190,10 +190,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         subtitle_output, related_subtitle_outputs = prepare_subtitle_output(
             mkv,
             track,
-            args.keep_subtitle,
+            args.temporary_subtitle,
             args.overwrite,
         )
-        print(f"字幕用途：{'保留输出' if args.keep_subtitle else '临时中间文件'}")
+        print(f"字幕用途：{'临时中间文件' if args.temporary_subtitle else '保留输出'}")
         print(f"字幕路径：{subtitle_output}")
         extract.extract_subtitle(mkv, track, subtitle_output)
 
@@ -207,7 +207,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         print("\n========== 全部完成 ==========")
         print(f"输出 MP4：{output}")
-        if args.keep_subtitle:
+        if not args.temporary_subtitle:
             print(f"保留字幕：{subtitle_output}")
         return 0
     except MkvToMp4Error as error:
@@ -223,7 +223,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"系统错误：{error}", file=sys.stderr)
         return 1
     finally:
-        if subtitle_output is not None and not args.keep_subtitle:
+        if subtitle_output is not None and args.temporary_subtitle:
             extract.remove_outputs(related_subtitle_outputs)
 
 
