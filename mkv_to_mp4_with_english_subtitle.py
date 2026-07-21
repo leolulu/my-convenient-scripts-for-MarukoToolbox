@@ -64,9 +64,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="允许覆盖已有的输出 MP4；保留字幕时也允许覆盖同名字幕",
     )
     parser.add_argument(
-        "--temporary-subtitle",
+        "--no-export-subtitle",
         action="store_true",
-        help="仅将提取字幕作为临时文件使用，并在流程结束后删除",
+        help="只烧录字幕，不在输出 MP4 旁边生成清洁后的字幕文件",
     )
     parser.add_argument(
         "--keep-media-temp",
@@ -109,28 +109,31 @@ def select_english_subtitle(mkv: Path) -> dict:
     return track
 
 
-def prepare_subtitle_output(
+def prepare_subtitle_outputs(
     mkv: Path,
     track: dict,
-    temporary_subtitle: bool,
+    no_export_subtitle: bool,
     overwrite: bool,
-) -> tuple[Path, list[Path]]:
-    source_output = extract.get_output_path(mkv, track)
-    if temporary_subtitle:
-        burn.TEMP_DIR.mkdir(parents=True, exist_ok=True)
-        temp_id = f"mkv_english_subtitle_{os.getpid()}_{uuid.uuid4().hex[:8]}"
-        subtitle_output = burn.TEMP_DIR / f"{temp_id}{source_output.suffix}"
-    else:
-        subtitle_output = source_output
-
-    related_outputs = extract.get_related_outputs(subtitle_output, track)
-    existing = [path for path in related_outputs if path.exists()]
+) -> tuple[Path, Path | None, list[Path]]:
+    exported_output = (
+        None if no_export_subtitle else extract.get_output_path(mkv, track)
+    )
+    exported_outputs = (
+        []
+        if exported_output is None
+        else extract.get_related_outputs(exported_output, track)
+    )
+    existing = [path for path in exported_outputs if path.exists()]
     if existing and not overwrite:
         formatted = "\n".join(f"  - {path}" for path in existing)
         fail(f"字幕输出已经存在；如需覆盖，请添加 --overwrite：\n{formatted}")
-    if existing:
-        extract.remove_outputs(related_outputs)
-    return subtitle_output, related_outputs
+
+    source_output = extract.get_output_path(mkv, track)
+    burn.TEMP_DIR.mkdir(parents=True, exist_ok=True)
+    temp_id = f"mkv_english_subtitle_{os.getpid()}_{uuid.uuid4().hex[:8]}"
+    burn_subtitle = burn.TEMP_DIR / f"{temp_id}{source_output.suffix}"
+    temporary_outputs = extract.get_related_outputs(burn_subtitle, track)
+    return burn_subtitle, exported_output, temporary_outputs
 
 
 def build_burn_arguments(
@@ -163,8 +166,9 @@ def build_burn_arguments(
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
 
-    subtitle_output: Path | None = None
-    related_subtitle_outputs: list[Path] = []
+    burn_subtitle: Path | None = None
+    exported_subtitle: Path | None = None
+    burn_subtitle_outputs: list[Path] = []
     try:
         extract.validate_binaries()
         mkv = extract.resolve_input(args.mkv)
@@ -187,18 +191,33 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
 
         print("\n========== 第 2 步：提取字幕 ==========")
-        subtitle_output, related_subtitle_outputs = prepare_subtitle_output(
-            mkv,
-            track,
-            args.temporary_subtitle,
-            args.overwrite,
+        burn_subtitle, exported_subtitle, burn_subtitle_outputs = (
+            prepare_subtitle_outputs(
+                mkv,
+                track,
+                args.no_export_subtitle,
+                args.overwrite,
+            )
         )
-        print(f"字幕用途：{'临时中间文件' if args.temporary_subtitle else '保留输出'}")
-        print(f"字幕路径：{subtitle_output}")
-        extract.extract_subtitle(mkv, track, subtitle_output)
+        subtitle_usage = (
+            "仅用于烧录" if args.no_export_subtitle else "烧录并保留清洁副本"
+        )
+        print(f"字幕用途：{subtitle_usage}")
+        print(f"原始烧录字幕（临时）：{burn_subtitle}")
+        extract.extract_subtitle(mkv, track, burn_subtitle)
+
+        if exported_subtitle is not None:
+            removed_count = extract.export_subtitle_copy(
+                burn_subtitle,
+                exported_subtitle,
+                track,
+            )
+            print(f"保留字幕路径：{exported_subtitle}")
+            if removed_count:
+                print(f"已从保留字幕中移除 {removed_count} 个定位标记。")
 
         print("\n========== 第 3 步：烧录字幕并生成 MP4 ==========")
-        burn_arguments = build_burn_arguments(args, mkv, subtitle_output, output)
+        burn_arguments = build_burn_arguments(args, mkv, burn_subtitle, output)
         burn_exit_code = burn.main(burn_arguments)
         if burn_exit_code == 130:
             raise KeyboardInterrupt
@@ -207,8 +226,8 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         print("\n========== 全部完成 ==========")
         print(f"输出 MP4：{output}")
-        if not args.temporary_subtitle:
-            print(f"保留字幕：{subtitle_output}")
+        if exported_subtitle is not None:
+            print(f"保留字幕：{exported_subtitle}")
         return 0
     except MkvToMp4Error as error:
         print(f"错误：{error}", file=sys.stderr)
@@ -223,8 +242,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"系统错误：{error}", file=sys.stderr)
         return 1
     finally:
-        if subtitle_output is not None and args.temporary_subtitle:
-            extract.remove_outputs(related_subtitle_outputs)
+        if burn_subtitle is not None:
+            extract.remove_outputs(
+                burn_subtitle_outputs,
+                warn_on_error=True,
+            )
 
 
 if __name__ == "__main__":

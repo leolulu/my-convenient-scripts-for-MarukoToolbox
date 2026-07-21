@@ -5,8 +5,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import re
+import shutil
 import subprocess
 import sys
+import uuid
 from pathlib import Path
 from typing import Any, NoReturn, Sequence
 
@@ -56,6 +60,10 @@ SUBTITLE_EXTENSIONS = {
     "S_VOBSUB": ".idx",
     "S_DVBSUB": ".sub",
 }
+ALIGNMENT_TAG_EXTENSIONS = {".srt", ".ass", ".ssa"}
+OVERRIDE_BLOCK_RE = re.compile(rb"\{[^{}\r\n]*\}")
+ALIGNMENT_TAG_RE = re.compile(rb"\\an[1-9](?!\d)", re.IGNORECASE)
+ASS_EVENT_PREFIXES = (b"dialogue:", b"comment:")
 
 
 class ExtractSubtitleError(RuntimeError):
@@ -263,12 +271,106 @@ def extract_subtitle(mkv: Path, track: dict[str, Any], output: Path) -> None:
         fail(f"mkvextract 未生成预期的字幕文件：{output}")
 
 
-def remove_outputs(outputs: Sequence[Path]) -> None:
+def make_staging_output(output: Path, label: str) -> Path:
+    token = f"{os.getpid()}_{uuid.uuid4().hex[:8]}"
+    return output.with_name(f".{output.stem}.{label}_{token}{output.suffix}")
+
+
+def remove_outputs(outputs: Sequence[Path], *, warn_on_error: bool = False) -> None:
     for output in outputs:
         try:
             output.unlink()
         except FileNotFoundError:
             pass
+        except OSError as error:
+            if not warn_on_error:
+                raise
+            print(f"警告：无法删除临时字幕文件 {output}：{error}", file=sys.stderr)
+
+
+def write_bytes_atomically(output: Path, content: bytes) -> None:
+    staging_output = make_staging_output(output, "clean")
+    try:
+        staging_output.write_bytes(content)
+        os.replace(staging_output, output)
+    finally:
+        remove_outputs([staging_output], warn_on_error=True)
+
+
+def remove_alignment_tags_from_content(content: bytes) -> tuple[bytes, int]:
+    removed_count = 0
+
+    def clean_override_block(match: re.Match[bytes]) -> bytes:
+        nonlocal removed_count
+        inner = match.group(0)[1:-1]
+        cleaned_inner, count = ALIGNMENT_TAG_RE.subn(b"", inner)
+        removed_count += count
+        if not cleaned_inner.strip():
+            return b""
+        return b"{" + cleaned_inner + b"}"
+
+    return OVERRIDE_BLOCK_RE.sub(clean_override_block, content), removed_count
+
+
+def clean_exported_alignment_tags(output: Path) -> int:
+    extension = output.suffix.lower()
+    if extension not in ALIGNMENT_TAG_EXTENSIONS:
+        return 0
+
+    original = output.read_bytes()
+    if extension == ".srt":
+        cleaned, removed_count = remove_alignment_tags_from_content(original)
+    else:
+        cleaned_lines: list[bytes] = []
+        removed_count = 0
+        for line in original.splitlines(keepends=True):
+            if line.lstrip().lower().startswith(ASS_EVENT_PREFIXES):
+                line, count = remove_alignment_tags_from_content(line)
+                removed_count += count
+            cleaned_lines.append(line)
+        cleaned = b"".join(cleaned_lines)
+
+    if cleaned != original:
+        write_bytes_atomically(output, cleaned)
+    return removed_count
+
+
+def publish_staged_subtitle_outputs(
+    staged_output: Path,
+    output: Path,
+    track: dict[str, Any],
+) -> None:
+    staged_outputs = get_related_outputs(staged_output, track)
+    final_outputs = get_related_outputs(output, track)
+    missing = [path for path in staged_outputs if not path.is_file()]
+    if missing:
+        formatted = "\n".join(f"  - {path}" for path in missing)
+        fail(f"缺少待发布的字幕文件：\n{formatted}")
+
+    for staged_path, final_path in zip(staged_outputs, final_outputs, strict=True):
+        os.replace(staged_path, final_path)
+
+
+def export_subtitle_copy(
+    source_output: Path,
+    output: Path,
+    track: dict[str, Any],
+) -> int:
+    staging_output = make_staging_output(output, "export")
+    source_outputs = get_related_outputs(source_output, track)
+    staging_outputs = get_related_outputs(staging_output, track)
+    try:
+        for source_path, staging_path in zip(
+            source_outputs,
+            staging_outputs,
+            strict=True,
+        ):
+            shutil.copyfile(source_path, staging_path)
+        removed_count = clean_exported_alignment_tags(staging_output)
+        publish_staged_subtitle_outputs(staging_output, output, track)
+        return removed_count
+    finally:
+        remove_outputs(staging_outputs, warn_on_error=True)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -308,9 +410,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         if existing and not args.overwrite:
             formatted = "\n".join(f"  - {path}" for path in existing)
             fail(f"输出文件已经存在；如需覆盖，请添加 --overwrite：\n{formatted}")
-        if args.overwrite:
-            remove_outputs(related_outputs)
-
         properties = track.get("properties", {})
         language = properties.get("language", "und")
         track_name = properties.get("track_name") or "（无名称）"
@@ -322,12 +421,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"选择原因：{decisions[-2] if len(decisions) >= 2 else decisions[-1]}")
         print(f"输出文件：{output}")
 
+        staging_output = make_staging_output(output, "extract")
+        staging_outputs = get_related_outputs(staging_output, track)
         try:
-            extract_subtitle(mkv, track, output)
-        except BaseException:
-            remove_outputs(related_outputs)
-            raise
+            extract_subtitle(mkv, track, staging_output)
+            removed_count = clean_exported_alignment_tags(staging_output)
+            publish_staged_subtitle_outputs(staging_output, output, track)
+        finally:
+            remove_outputs(staging_outputs, warn_on_error=True)
 
+        if removed_count:
+            print(f"已移除 {removed_count} 个字幕定位标记。")
         print(f"\n字幕提取完成：{output}")
         return 0
     except ExtractSubtitleError as error:
