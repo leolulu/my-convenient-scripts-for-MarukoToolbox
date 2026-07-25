@@ -37,6 +37,14 @@ class CommandLineTests(unittest.TestCase):
         )
 
         self.assertTrue(args.no_export_subtitle)
+        self.assertEqual(args.audio_language, "jpn")
+
+    def test_audio_language_accepts_english(self) -> None:
+        args = workflow.build_parser().parse_args(
+            ["sample.mkv", "--audio-language", "eng"]
+        )
+
+        self.assertEqual(args.audio_language, "eng")
 
     def test_temporary_subtitle_is_no_longer_supported(self) -> None:
         with mock.patch("sys.stderr"):
@@ -159,6 +167,7 @@ class WorkflowAlignmentTagTests(unittest.TestCase):
             output=output,
             crf=24.0,
             audio_bitrate=128,
+            audio_language="jpn",
             keyint=None,
             fallback_ffmpeg=None,
             overwrite=False,
@@ -210,6 +219,11 @@ class WorkflowAlignmentTagTests(unittest.TestCase):
 
             self.assertEqual(exit_code, 0)
             self.assertEqual(Path(burned_arguments[1]), raw)
+            audio_language_index = burned_arguments.index("--audio-language")
+            self.assertEqual(
+                burned_arguments[audio_language_index + 1],
+                "jpn",
+            )
             self.assertIn(b"{\\an8}Top line", burned_content)
             self.assertNotIn(b"\\an8", exported.read_bytes())
             self.assertFalse(raw.exists())
