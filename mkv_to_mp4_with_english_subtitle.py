@@ -143,11 +143,40 @@ def prepare_subtitle_outputs(
     return burn_subtitle, exported_output, temporary_outputs
 
 
+def prepare_font_directory(mkv: Path, track: dict) -> Path | None:
+    codec_id = str(track.get("properties", {}).get("codec_id", ""))
+    if codec_id != "S_TEXT/ASS":
+        return None
+
+    attachments = extract.identify_attachments(mkv)
+    font_attachments = extract.get_font_attachments(attachments)
+    if not font_attachments:
+        print("MKV 中没有字体附件；ASS 字幕继续使用现有烧录路径。")
+        return None
+
+    burn.TEMP_DIR.mkdir(parents=True, exist_ok=True)
+    temp_id = f"mkv_fonts_{os.getpid()}_{uuid.uuid4().hex[:8]}"
+    fonts_dir = burn.TEMP_DIR / temp_id
+    try:
+        outputs = extract.extract_font_attachments(
+            mkv,
+            font_attachments,
+            fonts_dir,
+        )
+    except BaseException:
+        extract.remove_directory(fonts_dir, warn_on_error=True)
+        raise
+
+    print(f"已提取 {len(outputs)} 个临时字体：{fonts_dir}")
+    return fonts_dir
+
+
 def build_burn_arguments(
     args: argparse.Namespace,
     mkv: Path,
     subtitle: Path,
     output: Path,
+    fonts_dir: Path | None = None,
 ) -> list[str]:
     arguments = [
         str(mkv),
@@ -165,6 +194,8 @@ def build_burn_arguments(
         arguments.extend(("--keyint", str(args.keyint)))
     if args.fallback_ffmpeg is not None:
         arguments.extend(("--fallback-ffmpeg", str(args.fallback_ffmpeg)))
+    if fonts_dir is not None:
+        arguments.extend(("--fonts-dir", str(fonts_dir)))
     if args.overwrite:
         arguments.append("--overwrite")
     if args.keep_media_temp:
@@ -178,6 +209,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     burn_subtitle: Path | None = None
     exported_subtitle: Path | None = None
     burn_subtitle_outputs: list[Path] = []
+    fonts_dir: Path | None = None
     try:
         extract.validate_binaries()
         mkv = extract.resolve_input(args.mkv)
@@ -214,6 +246,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"字幕用途：{subtitle_usage}")
         print(f"原始烧录字幕（临时）：{burn_subtitle}")
         extract.extract_subtitle(mkv, track, burn_subtitle)
+        fonts_dir = prepare_font_directory(mkv, track)
 
         if exported_subtitle is not None:
             removed_count = extract.export_subtitle_copy(
@@ -226,7 +259,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                 print(f"已从保留字幕中移除 {removed_count} 个定位标记。")
 
         print("\n========== 第 3 步：烧录字幕并生成 MP4 ==========")
-        burn_arguments = build_burn_arguments(args, mkv, burn_subtitle, output)
+        burn_arguments = build_burn_arguments(
+            args,
+            mkv,
+            burn_subtitle,
+            output,
+            fonts_dir,
+        )
         burn_exit_code = burn.main(burn_arguments)
         if burn_exit_code == 130:
             raise KeyboardInterrupt
@@ -251,6 +290,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"系统错误：{error}", file=sys.stderr)
         return 1
     finally:
+        if fonts_dir is not None:
+            extract.remove_directory(fonts_dir, warn_on_error=True)
         if burn_subtitle is not None:
             extract.remove_outputs(
                 burn_subtitle_outputs,

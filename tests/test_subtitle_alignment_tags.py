@@ -192,6 +192,11 @@ class WorkflowAlignmentTagTests(unittest.TestCase):
                 "extract_subtitle",
                 side_effect=write_extracted_subtitle,
             ),
+            mock.patch.object(
+                workflow,
+                "prepare_font_directory",
+                return_value=None,
+            ),
             mock.patch.object(workflow.burn, "main", side_effect=burn_main),
         ):
             build_parser.return_value.parse_args.return_value = args
