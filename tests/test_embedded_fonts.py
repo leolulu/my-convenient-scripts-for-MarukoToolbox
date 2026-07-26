@@ -297,6 +297,7 @@ class WorkflowFontCleanupTests(unittest.TestCase):
                 output=output,
                 crf=24.0,
                 audio_bitrate=128,
+                audio_language="jpn",
                 keyint=None,
                 fallback_ffmpeg=None,
                 overwrite=False,
@@ -351,6 +352,7 @@ class WorkflowFontCleanupTests(unittest.TestCase):
         args = Namespace(
             crf=24.0,
             audio_bitrate=128,
+            audio_language="jpn",
             keyint=None,
             fallback_ffmpeg=None,
             overwrite=False,
