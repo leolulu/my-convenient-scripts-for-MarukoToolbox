@@ -60,10 +60,20 @@ SUBTITLE_EXTENSIONS = {
     "S_VOBSUB": ".idx",
     "S_DVBSUB": ".sub",
 }
+FONT_EXTENSIONS = {".otc", ".otf", ".ttc", ".ttf"}
+FONT_CONTENT_TYPES = {
+    "application/font-sfnt",
+    "application/vnd.ms-opentype",
+    "application/x-font-opentype",
+    "application/x-font-otf",
+    "application/x-font-truetype",
+    "application/x-font-ttf",
+}
 ALIGNMENT_TAG_EXTENSIONS = {".srt", ".ass", ".ssa"}
 OVERRIDE_BLOCK_RE = re.compile(rb"\{[^{}\r\n]*\}")
 ALIGNMENT_TAG_RE = re.compile(rb"\\an[1-9](?!\d)", re.IGNORECASE)
 ASS_EVENT_PREFIXES = (b"dialogue:", b"comment:")
+INVALID_ATTACHMENT_FILENAME_RE = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 
 
 class ExtractSubtitleError(RuntimeError):
@@ -106,7 +116,7 @@ def validate_binaries() -> None:
         fail(f"缺少小丸工具箱二进制文件：\n{formatted}")
 
 
-def identify_tracks(mkv: Path) -> list[dict[str, Any]]:
+def identify_mkv(mkv: Path) -> dict[str, Any]:
     command = [MKVMERGE, "-J", mkv]
     result = subprocess.run(
         command,
@@ -130,10 +140,97 @@ def identify_tracks(mkv: Path) -> list[dict[str, Any]]:
     if errors:
         fail("mkvmerge 报告错误：\n" + "\n".join(str(error) for error in errors))
 
+    return identification
+
+
+def identify_tracks(mkv: Path) -> list[dict[str, Any]]:
+    identification = identify_mkv(mkv)
     tracks = identification.get("tracks")
     if not isinstance(tracks, list):
         fail("mkvmerge 返回的数据中缺少轨道列表")
     return tracks
+
+
+def identify_attachments(mkv: Path) -> list[dict[str, Any]]:
+    identification = identify_mkv(mkv)
+    attachments = identification.get("attachments") or []
+    if not isinstance(attachments, list):
+        fail("mkvmerge 返回的附件列表格式无效")
+    return attachments
+
+
+def is_font_attachment(attachment: dict[str, Any]) -> bool:
+    file_name = str(attachment.get("file_name") or "")
+    extension = Path(file_name).suffix.lower()
+    content_type = str(attachment.get("content_type") or "").lower()
+    return (
+        extension in FONT_EXTENSIONS
+        or content_type.startswith("font/")
+        or content_type in FONT_CONTENT_TYPES
+    )
+
+
+def get_font_attachments(
+    attachments: Sequence[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    return [attachment for attachment in attachments if is_font_attachment(attachment)]
+
+
+def get_attachment_output_name(attachment: dict[str, Any]) -> str:
+    attachment_id = int(attachment["id"])
+    original_name = Path(str(attachment.get("file_name") or "")).name
+    safe_name = INVALID_ATTACHMENT_FILENAME_RE.sub("_", original_name)
+    safe_name = safe_name.rstrip(" .") or "font"
+    return f"{attachment_id}_{safe_name}"
+
+
+def extract_font_attachments(
+    mkv: Path,
+    attachments: Sequence[dict[str, Any]],
+    output_dir: Path,
+) -> list[Path]:
+    font_attachments = get_font_attachments(attachments)
+    if not font_attachments:
+        return []
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    outputs = [
+        output_dir / get_attachment_output_name(attachment)
+        for attachment in font_attachments
+    ]
+    command: list[os.PathLike[str] | str] = [MKVEXTRACT, "attachments", mkv]
+    command.extend(
+        f"{int(attachment['id'])}:{output}"
+        for attachment, output in zip(font_attachments, outputs, strict=True)
+    )
+
+    print("执行字体提取命令：")
+    print(subprocess.list2cmdline([os.fspath(argument) for argument in command]), flush=True)
+
+    result = subprocess.run(
+        command,
+        cwd=ROOT_DIR,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if result.returncode not in (0, 1):
+        remove_outputs(outputs, warn_on_error=True)
+        details = (result.stdout + result.stderr).decode(
+            "utf-8", errors="replace"
+        ).strip()
+        if details:
+            details = f"\n{details}"
+        fail(f"mkvextract 提取字体失败，退出码：{result.returncode}{details}")
+    if result.returncode == 1:
+        print("警告：mkvextract 提取字体完成，但报告了警告。", file=sys.stderr)
+
+    missing = [output for output in outputs if not output.is_file()]
+    if missing:
+        remove_outputs(outputs, warn_on_error=True)
+        formatted = "\n".join(f"  - {path}" for path in missing)
+        fail(f"mkvextract 未生成预期的字体文件：\n{formatted}")
+    return outputs
 
 
 def select_subtitle(
@@ -286,6 +383,17 @@ def remove_outputs(outputs: Sequence[Path], *, warn_on_error: bool = False) -> N
             if not warn_on_error:
                 raise
             print(f"警告：无法删除临时字幕文件 {output}：{error}", file=sys.stderr)
+
+
+def remove_directory(path: Path, *, warn_on_error: bool = False) -> None:
+    try:
+        shutil.rmtree(path)
+    except FileNotFoundError:
+        pass
+    except OSError as error:
+        if not warn_on_error:
+            raise
+        print(f"警告：无法删除临时目录 {path}：{error}", file=sys.stderr)
 
 
 def write_bytes_atomically(output: Path, content: bytes) -> None:

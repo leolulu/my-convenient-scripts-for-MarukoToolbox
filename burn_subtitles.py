@@ -4,12 +4,14 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
 import os
 import re
 import shutil
 import subprocess
 import sys
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
 from typing import NoReturn, Sequence
 
@@ -23,15 +25,74 @@ FFMPEG = TOOLS_DIR / "ffmpeg.exe"
 NERO_AAC = TOOLS_DIR / "neroAacEnc.exe"
 X264 = TOOLS_DIR / "x264_64-8bit.exe"
 MP4BOX = TOOLS_DIR / "MP4Box.exe"
+MEDIAINFO = (
+    TOOLS_DIR / "x64" / "MediaInfo.dll"
+    if ctypes.sizeof(ctypes.c_void_p) == 8
+    else TOOLS_DIR / "MediaInfo.dll"
+)
 
 VIDEO_STREAM_RE = re.compile(r"^\s*Stream .+Video:", re.MULTILINE)
 AUDIO_STREAM_RE = re.compile(r"^\s*Stream .+Audio:", re.MULTILINE)
 FPS_RE = re.compile(r"(?:,|\s)(\d+(?:\.\d+)?)\s*fps(?:,|\s)", re.IGNORECASE)
 TBR_RE = re.compile(r"(?:,|\s)(\d+(?:\.\d+)?)\s*tbr(?:,|\s)", re.IGNORECASE)
 
+COLOR_RANGE_MAP = {
+    "limited": "tv",
+    "full": "pc",
+}
+COLOR_PRIMARIES_MAP = {
+    "bt709": "bt709",
+    "bt470systemm": "bt470m",
+    "bt470systembg": "bt470bg",
+    "smpte170m": "smpte170m",
+    "smpte240m": "smpte240m",
+    "film": "film",
+    "bt2020": "bt2020",
+    "smptest4281": "smpte428",
+    "smptest4312": "smpte431",
+    "smptest4321": "smpte432",
+}
+TRANSFER_CHARACTERISTICS_MAP = {
+    "bt709": "bt709",
+    "bt470systemm": "bt470m",
+    "bt470systembg": "bt470bg",
+    "smpte170m": "smpte170m",
+    "smpte240m": "smpte240m",
+    "linear": "linear",
+    "logarithmic1001": "log100",
+    "logarithmic3162271": "log316",
+    "iec6196624": "iec61966-2-4",
+    "bt1361": "bt1361e",
+    "iec6196621": "iec61966-2-1",
+    "bt202010bit": "bt2020-10",
+    "bt202012bit": "bt2020-12",
+    "smptest2084": "smpte2084",
+    "smptest4281": "smpte428",
+}
+MATRIX_COEFFICIENTS_MAP = {
+    "bt709": "bt709",
+    "fcc73682": "fcc",
+    "bt470systembg": "bt470bg",
+    "smpte170m": "smpte170m",
+    "smpte240m": "smpte240m",
+    "gbr": "GBR",
+    "ycgco": "YCgCo",
+    "bt2020nonconstant": "bt2020nc",
+    "bt2020constant": "bt2020c",
+    "smptest2085": "smpte2085",
+}
+
 
 class BurnSubtitlesError(RuntimeError):
     """字幕压制流程失败。"""
+
+
+@dataclass(frozen=True)
+class VideoColorInfo:
+    color_range: str | None
+    color_primaries: str | None
+    transfer_characteristics: str | None
+    matrix_coefficients: str | None
 
 
 def positive_int(value: str) -> int:
@@ -90,6 +151,14 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--fonts-dir",
+        type=Path,
+        help=(
+            "ASS 字幕使用的字体目录；指定后由 ffmpeg/libass 烧录字幕，"
+            "再通过 Y4M 管道交给小丸 x264 压制"
+        ),
+    )
+    parser.add_argument(
         "--overwrite",
         action="store_true",
         help="允许覆盖已经存在的输出文件",
@@ -113,6 +182,46 @@ def resolve_input(path: Path, label: str) -> Path:
     return resolved
 
 
+def resolve_fonts_dir(path: Path | None) -> Path | None:
+    if path is None:
+        return None
+
+    resolved = path.expanduser().resolve()
+    if not resolved.is_dir():
+        fail(f"字体目录不存在或不是目录：{resolved}")
+    if not any(child.is_file() for child in resolved.iterdir()):
+        fail(f"字体目录中没有字体文件：{resolved}")
+    return resolved
+
+
+def prepare_ffmpeg_fonts_dir(fonts_dir: Path | None) -> tuple[Path | None, Path | None]:
+    if fonts_dir is None:
+        return None, None
+
+    font_files = [child for child in fonts_dir.iterdir() if child.is_file()]
+    if os.fspath(fonts_dir).isascii() and all(
+        font_file.name.isascii() for font_file in font_files
+    ):
+        return fonts_dir, None
+
+    TEMP_DIR.mkdir(parents=True, exist_ok=True)
+    temp_id = f"burn_fonts_{os.getpid()}_{uuid.uuid4().hex[:8]}"
+    staged_dir = TEMP_DIR / temp_id
+    staged_dir.mkdir()
+    try:
+        for index, source in enumerate(font_files, start=1):
+            suffix = source.suffix.lower()
+            if not suffix.isascii() or not suffix[1:].isalnum():
+                suffix = ".font"
+            shutil.copyfile(source, staged_dir / f"{index:04d}{suffix}")
+    except BaseException:
+        shutil.rmtree(staged_dir, ignore_errors=True)
+        raise
+
+    print(f"字体目录包含非 ASCII 路径；已暂存到：{staged_dir}")
+    return staged_dir, staged_dir
+
+
 def resolve_output(video: Path, output: Path | None) -> Path:
     if output is None:
         resolved = video.with_name(f"{video.stem}_x264.mp4")
@@ -131,7 +240,11 @@ def resolve_output(video: Path, output: Path | None) -> Path:
 
 
 def validate_binaries() -> None:
-    missing = [path for path in (FFMPEG, NERO_AAC, X264, MP4BOX) if not path.is_file()]
+    missing = [
+        path
+        for path in (FFMPEG, NERO_AAC, X264, MP4BOX, MEDIAINFO)
+        if not path.is_file()
+    ]
     if missing:
         formatted = "\n".join(f"  - {path}" for path in missing)
         fail(f"缺少小丸工具箱二进制文件：\n{formatted}")
@@ -141,9 +254,23 @@ def display_command(command: Sequence[os.PathLike[str] | str]) -> str:
     return subprocess.list2cmdline([os.fspath(argument) for argument in command])
 
 
+def escape_ffmpeg_filter_path(path: Path) -> str:
+    escaped = path.resolve().as_posix()
+    escaped = escaped.replace("\\", r"\\")
+    escaped = escaped.replace(":", r"\:")
+    escaped = escaped.replace("'", r"\'")
+    return escaped
+
+
+def build_subtitles_filter(subtitle: Path, fonts_dir: Path) -> str:
+    subtitle_path = escape_ffmpeg_filter_path(subtitle)
+    fonts_path = escape_ffmpeg_filter_path(fonts_dir)
+    return f"subtitles='{subtitle_path}':fontsdir='{fonts_path}'"
+
+
 def normalize_y4m_header(header: bytes) -> bytes:
     if not header.startswith(b"YUV4MPEG2 "):
-        fail("外部 ffmpeg 未输出有效的 Y4M 视频头")
+        fail("ffmpeg 未输出有效的 Y4M 视频头")
 
     fields = header.rstrip(b"\r\n").split(b" ")
     fields = [
@@ -161,7 +288,104 @@ def run_command(command: Sequence[os.PathLike[str] | str], stage: str) -> None:
         fail(f"{stage}失败，退出码：{result.returncode}")
 
 
-def probe_video(video: Path) -> tuple[float | None, bool, bool]:
+def normalize_mediainfo_value(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", value.casefold())
+
+
+def map_mediainfo_color_value(
+    value: str,
+    mapping: dict[str, str],
+    label: str,
+) -> str | None:
+    if not value:
+        return None
+
+    mapped = mapping.get(normalize_mediainfo_value(value))
+    if mapped is None:
+        print(
+            f"警告：源视频的{label}“{value}”无法映射到当前 x264，"
+            "该项将保持未指定",
+            file=sys.stderr,
+        )
+    return mapped
+
+
+def probe_video_color(video: Path) -> VideoColorInfo:
+    try:
+        library = ctypes.WinDLL(os.fspath(MEDIAINFO))
+    except (AttributeError, OSError) as error:
+        fail(f"无法加载 MediaInfo：{MEDIAINFO}：{error}")
+
+    library.MediaInfo_New.restype = ctypes.c_void_p
+    library.MediaInfo_Delete.argtypes = [ctypes.c_void_p]
+    library.MediaInfo_Open.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p]
+    library.MediaInfo_Open.restype = ctypes.c_size_t
+    library.MediaInfo_Close.argtypes = [ctypes.c_void_p]
+    library.MediaInfo_Get.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_size_t,
+        ctypes.c_size_t,
+        ctypes.c_wchar_p,
+        ctypes.c_size_t,
+        ctypes.c_size_t,
+    ]
+    library.MediaInfo_Get.restype = ctypes.c_wchar_p
+
+    handle = library.MediaInfo_New()
+    if not handle:
+        fail("MediaInfo 初始化失败")
+
+    opened = False
+    try:
+        opened = bool(library.MediaInfo_Open(handle, os.fspath(video)))
+        if not opened:
+            fail(f"MediaInfo 无法读取输入视频：{video}")
+
+        def get(parameter: str) -> str:
+            return library.MediaInfo_Get(handle, 1, 0, parameter, 1, 0) or ""
+
+        return VideoColorInfo(
+            color_range=map_mediainfo_color_value(
+                get("colour_range"),
+                COLOR_RANGE_MAP,
+                "色彩范围",
+            ),
+            color_primaries=map_mediainfo_color_value(
+                get("colour_primaries"),
+                COLOR_PRIMARIES_MAP,
+                "色彩原色",
+            ),
+            transfer_characteristics=map_mediainfo_color_value(
+                get("transfer_characteristics"),
+                TRANSFER_CHARACTERISTICS_MAP,
+                "传递特性",
+            ),
+            matrix_coefficients=map_mediainfo_color_value(
+                get("matrix_coefficients"),
+                MATRIX_COEFFICIENTS_MAP,
+                "矩阵系数",
+            ),
+        )
+    finally:
+        if opened:
+            library.MediaInfo_Close(handle)
+        library.MediaInfo_Delete(handle)
+
+
+def build_x264_color_options(color_info: VideoColorInfo) -> list[str]:
+    options: list[str] = []
+    for option, value in (
+        ("--range", color_info.color_range),
+        ("--colorprim", color_info.color_primaries),
+        ("--transfer", color_info.transfer_characteristics),
+        ("--colormatrix", color_info.matrix_coefficients),
+    ):
+        if value is not None:
+            options.extend((option, value))
+    return options
+
+
+def probe_video(video: Path) -> tuple[float | None, bool, bool, VideoColorInfo]:
     command = [FFMPEG, "-i", video]
     result = subprocess.run(
         command,
@@ -194,6 +418,7 @@ def probe_video(video: Path) -> tuple[float | None, bool, bool]:
         frame_rate,
         bool(AUDIO_STREAM_RE.search(probe_text)),
         bundled_decoder_supported,
+        probe_video_color(video),
     )
 
 
@@ -320,7 +545,11 @@ def encode_video(
     crf: float,
     keyint: int,
     fallback_ffmpeg: Path | None,
+    fonts_dir: Path | None = None,
+    color_info: VideoColorInfo | None = None,
 ) -> None:
+    use_fonts_pipeline = fonts_dir is not None and subtitle.suffix.lower() == ".ass"
+    use_y4m_pipeline = fallback_ffmpeg is not None or use_fonts_pipeline
     x264_command = [
         X264,
         "--crf",
@@ -349,40 +578,60 @@ def encode_video(
         "2",
         "--aq-strength",
         "0.8",
-        "--vf",
-        "subtitles",
-        "--sub",
-        subtitle,
-        "-o",
-        video_temp,
     ]
+    if use_y4m_pipeline and color_info is not None:
+        x264_command.extend(build_x264_color_options(color_info))
+    if not use_fonts_pipeline:
+        x264_command.extend(("--vf", "subtitles", "--sub", subtitle))
+    x264_command.extend(("-o", video_temp))
 
-    if fallback_ffmpeg is None:
+    if fallback_ffmpeg is None and not use_fonts_pipeline:
         x264_command.append(video)
         run_command(x264_command, "烧录字幕并压制视频")
         return
 
+    decoder_ffmpeg = fallback_ffmpeg or FFMPEG
     decoder_command = [
-        fallback_ffmpeg,
+        decoder_ffmpeg,
         "-v",
         "error",
         "-nostdin",
-        "-i",
-        video,
-        "-map",
-        "0:v:0",
-        "-an",
-        "-sn",
-        "-pix_fmt",
-        "yuv420p",
-        "-f",
-        "yuv4mpegpipe",
-        "-",
     ]
+    if use_fonts_pipeline:
+        assert fonts_dir is not None
+        decoder_command.extend(("-copyts", "-start_at_zero"))
+    decoder_command.extend(
+        (
+            "-i",
+            video,
+            "-map",
+            "0:v:0",
+            "-an",
+            "-sn",
+        )
+    )
+    if use_fonts_pipeline:
+        decoder_command.extend(
+            ("-vf", build_subtitles_filter(subtitle, fonts_dir))
+        )
+    decoder_command.extend(
+        (
+            "-pix_fmt",
+            "yuv420p",
+            "-f",
+            "yuv4mpegpipe",
+            "-",
+        )
+    )
     x264_command.extend(("--demuxer", "y4m", "-"))
 
+    stage = (
+        "ffmpeg 烧录 ASS 字幕、x264 压制视频"
+        if use_fonts_pipeline
+        else "外部解码、烧录字幕并压制视频"
+    )
     print(
-        f"\n[外部解码、烧录字幕并压制视频]\n{display_command(decoder_command)}"
+        f"\n[{stage}]\n{display_command(decoder_command)}"
         f" | {display_command(x264_command)}",
         flush=True,
     )
@@ -431,7 +680,7 @@ def encode_video(
     if decoder_returncode != 0 or x264_returncode != 0:
         fail(
             "视频压制失败，"
-            f"外部 ffmpeg 退出码：{decoder_returncode}，x264 退出码：{x264_returncode}"
+            f"ffmpeg 退出码：{decoder_returncode}，x264 退出码：{x264_returncode}"
         )
 
 
@@ -457,19 +706,38 @@ def remove_file(path: Path) -> None:
         print(f"警告：无法删除中间文件 {path}：{error}", file=sys.stderr)
 
 
+def remove_directory(path: Path) -> None:
+    try:
+        shutil.rmtree(path)
+    except FileNotFoundError:
+        pass
+    except OSError as error:
+        print(f"警告：无法删除临时目录 {path}：{error}", file=sys.stderr)
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    staged_fonts_dir: Path | None = None
 
     try:
         validate_binaries()
         video = resolve_input(args.video, "输入视频")
         subtitle = resolve_input(args.subtitle, "字幕文件")
+        fonts_dir = resolve_fonts_dir(args.fonts_dir)
+        if fonts_dir is not None and subtitle.suffix.lower() != ".ass":
+            fail("--fonts-dir 仅支持与 ASS 字幕一起使用")
+        fonts_dir, staged_fonts_dir = prepare_ffmpeg_fonts_dir(fonts_dir)
         output = resolve_output(video, args.output)
 
         if output.exists() and not args.overwrite:
             fail(f"输出文件已经存在；如需覆盖，请添加 --overwrite：{output}")
 
-        frame_rate, has_audio, bundled_decoder_supported = probe_video(video)
+        (
+            frame_rate,
+            has_audio,
+            bundled_decoder_supported,
+            color_info,
+        ) = probe_video(video)
         if not has_audio:
             fail("输入视频不包含音频流，当前脚本无法执行“压制音频”流程")
 
@@ -479,11 +747,20 @@ def main(argv: Sequence[str] | None = None) -> int:
         keyint = args.keyint or max(1, round(frame_rate * 10))
         print(f"输入视频：{video}")
         print(f"字幕文件：{subtitle}")
+        if fonts_dir is not None:
+            print(f"字体目录：{fonts_dir}")
         print(f"输出文件：{output}")
         if frame_rate is None:
             print(f"检测帧率：无法识别；使用指定的关键帧间隔：{keyint}")
         else:
             print(f"检测帧率：{frame_rate:g} fps；关键帧间隔：{keyint}")
+        print(
+            "检测色彩："
+            f"range={color_info.color_range or 'unknown'}，"
+            f"primaries={color_info.color_primaries or 'unknown'}，"
+            f"transfer={color_info.transfer_characteristics or 'unknown'}，"
+            f"matrix={color_info.matrix_coefficients or 'unknown'}"
+        )
 
         fallback_ffmpeg = None
         if not bundled_decoder_supported:
@@ -507,6 +784,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 args.crf,
                 keyint,
                 fallback_ffmpeg,
+                fonts_dir,
+                color_info,
             )
 
             if output.exists():
@@ -535,6 +814,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     except OSError as error:
         print(f"系统错误：{error}", file=sys.stderr)
         return 1
+    finally:
+        if staged_fonts_dir is not None:
+            remove_directory(staged_fonts_dir)
 
 
 if __name__ == "__main__":
