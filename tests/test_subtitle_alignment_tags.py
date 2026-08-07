@@ -174,6 +174,59 @@ class BatchCliTests(unittest.TestCase):
             output = "".join(c[0][0] for c in stdout.write.call_args_list)
             self.assertIn("跳过 1 个已处理", output)
             self.assertIn("成功 1 个", output)
+            self.assertIn("失败 0 个", output)
+
+    def test_main_continues_after_each_supported_processing_error(self) -> None:
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as temp_dir:
+            root = Path(temp_dir)
+            names = ["a.mkv", "b.mkv", "c.mkv", "d.mkv"]
+            for name in names:
+                (root / name).touch()
+
+            processed: list[str] = []
+
+            def process(_args: Namespace, mkv: Path) -> None:
+                processed.append(mkv.name)
+                if mkv.name == "a.mkv":
+                    raise workflow.MkvToMp4Error("没有字幕轨")
+                if mkv.name == "b.mkv":
+                    raise extract.ExtractSubtitleError("字幕无法提取")
+                if mkv.name == "c.mkv":
+                    raise OSError("网络文件不可读")
+
+            with mock.patch.object(workflow, "process_one", side_effect=process):
+                with mock.patch("sys.stdout") as stdout, mock.patch("sys.stderr") as stderr:
+                    exit_code = workflow.main([str(root)])
+
+            self.assertEqual(exit_code, 1)
+            self.assertEqual(processed, names)
+            output = "".join(c[0][0] for c in stdout.write.call_args_list)
+            errors = "".join(c[0][0] for c in stderr.write.call_args_list)
+            self.assertIn("成功 1 个", output)
+            self.assertIn("失败 3 个", output)
+            self.assertIn("a.mkv", errors)
+            self.assertIn("没有字幕轨", errors)
+            self.assertIn("字幕提取错误：字幕无法提取", errors)
+            self.assertIn("系统错误：网络文件不可读", errors)
+
+    def test_main_keyboard_interrupt_stops_the_batch(self) -> None:
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as temp_dir:
+            root = Path(temp_dir)
+            (root / "a.mkv").touch()
+            (root / "b.mkv").touch()
+
+            processed: list[str] = []
+
+            def process(_args: Namespace, mkv: Path) -> None:
+                processed.append(mkv.name)
+                raise KeyboardInterrupt
+
+            with mock.patch.object(workflow, "process_one", side_effect=process):
+                with mock.patch("sys.stderr"):
+                    exit_code = workflow.main([str(root)])
+
+            self.assertEqual(exit_code, 130)
+            self.assertEqual(processed, ["a.mkv"])
 
 
 class CleanExportedAlignmentTagsTests(unittest.TestCase):

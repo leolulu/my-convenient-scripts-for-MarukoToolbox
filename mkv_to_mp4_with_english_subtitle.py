@@ -316,6 +316,15 @@ def is_processed(mkv: Path, args: argparse.Namespace) -> bool:
     return output.exists() and not args.overwrite
 
 
+def describe_processing_error(error: BaseException) -> str:
+    """为批处理失败明细保留原有异常分类。"""
+    if isinstance(error, extract.ExtractSubtitleError):
+        return f"字幕提取错误：{error}"
+    if isinstance(error, OSError):
+        return f"系统错误：{error}"
+    return str(error)
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
@@ -323,15 +332,33 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.output is not None and len(mkvs) != 1:
             fail("--output 仅支持单个 MKV 输入；批量或目录模式使用默认输出命名")
         processed_skipped = 0
+        succeeded = 0
+        failures: list[tuple[Path, str]] = []
         for index, mkv in enumerate(mkvs, start=1):
             print(f"\n========== 处理 {index}/{len(mkvs)}：{mkv} ==========")
-            if is_processed(mkv, args):
-                print(f"已处理过，跳过：{mkv}")
-                processed_skipped += 1
+            try:
+                if is_processed(mkv, args):
+                    print(f"已处理过，跳过：{mkv}")
+                    processed_skipped += 1
+                    continue
+                process_one(args, mkv)
+            except (MkvToMp4Error, extract.ExtractSubtitleError, OSError) as error:
+                reason = describe_processing_error(error)
+                failures.append((mkv, reason))
+                print(f"处理失败：{mkv}", file=sys.stderr)
+                print(f"原因：{reason}", file=sys.stderr)
                 continue
-            process_one(args, mkv)
-        print(f"\n全部完成：共 {len(mkvs)} 个输入，跳过 {processed_skipped} 个已处理，"
-              f"成功 {len(mkvs) - processed_skipped} 个。")
+            succeeded += 1
+        print(
+            f"\n全部处理结束：共 {len(mkvs)} 个输入，"
+            f"跳过 {processed_skipped} 个已处理，成功 {succeeded} 个，"
+            f"失败 {len(failures)} 个。"
+        )
+        if failures:
+            print("\n失败明细：", file=sys.stderr)
+            for mkv, reason in failures:
+                print(f"  - {mkv}：{reason}", file=sys.stderr)
+            return 1
         return 0
     except MkvToMp4Error as error:
         print(f"错误：{error}", file=sys.stderr)
