@@ -25,7 +25,12 @@ def build_parser() -> argparse.ArgumentParser:
             "然后复用小丸压制流程将字幕烧录到 MP4。"
         )
     )
-    parser.add_argument("mkv", type=Path, help="输入 MKV 文件")
+    parser.add_argument(
+        "inputs",
+        type=Path,
+        nargs="+",
+        help="输入 MKV 文件或目录；目录会处理其中顶层所有 .mkv，已输出过的自动跳过",
+    )
     parser.add_argument(
         "-o",
         "--output",
@@ -194,16 +199,14 @@ def build_burn_arguments(
     return arguments
 
 
-def main(argv: Sequence[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
-
+def process_one(args: argparse.Namespace, mkv: Path) -> None:
+    """对单个 MKV 执行完整的识别→提取→烧录流程；失败抛 MkvToMp4Error/ExtractSubtitleError。"""
     burn_subtitle: Path | None = None
     exported_subtitle: Path | None = None
     burn_subtitle_outputs: list[Path] = []
     fonts_dir: Path | None = None
     try:
         extract.validate_binaries()
-        mkv = extract.resolve_input(args.mkv)
 
         print("========== 第 1 步：识别英文字幕 ==========")
         print(f"输入文件：{mkv}")
@@ -267,6 +270,59 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"输出 MP4：{output}")
         if exported_subtitle is not None:
             print(f"保留字幕：{exported_subtitle}")
+    finally:
+        if fonts_dir is not None:
+            extract.remove_directory(fonts_dir, warn_on_error=True)
+        if burn_subtitle is not None:
+            extract.remove_outputs(
+                burn_subtitle_outputs,
+                warn_on_error=True,
+            )
+
+
+def expand_inputs(inputs: Sequence[Path]) -> list[Path]:
+    """展开用户传入的位置参数：目录→其中顶层所有 .mkv 文件，文件→原样；去重保序。"""
+    expanded: list[Path] = []
+    for item in inputs:
+        p = item.expanduser().resolve()
+        if p.is_dir():
+            mkv_files = [
+                child
+                for child in p.iterdir()
+                if child.is_file() and child.suffix.lower() == ".mkv"
+            ]
+            if not mkv_files:
+                print(f"目录中没有 .mkv 文件，跳过：{p}", file=sys.stderr)
+            expanded.extend(mkv_files)
+        elif p.is_file():
+            expanded.append(extract.resolve_input(p))
+        else:
+            fail(f"输入路径不存在或既不是文件也不是目录：{p}")
+    return list(dict.fromkeys(expanded))
+
+
+def is_processed(mkv: Path, args: argparse.Namespace) -> bool:
+    """输出 MP4 已存在即视为已处理。"""
+    output = burn.resolve_output(mkv, None)
+    return output.exists() and not args.overwrite
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    try:
+        mkvs = expand_inputs(args.inputs)
+        if args.output is not None and len(mkvs) != 1:
+            fail("--output 仅支持单个 MKV 输入；批量或目录模式使用默认输出命名")
+        processed_skipped = 0
+        for index, mkv in enumerate(mkvs, start=1):
+            print(f"\n========== 处理 {index}/{len(mkvs)}：{mkv} ==========")
+            if is_processed(mkv, args):
+                print(f"已处理过，跳过：{mkv}")
+                processed_skipped += 1
+                continue
+            process_one(args, mkv)
+        print(f"\n全部完成：共 {len(mkvs)} 个输入，跳过 {processed_skipped} 个已处理，"
+              f"成功 {len(mkvs) - processed_skipped} 个。")
         return 0
     except MkvToMp4Error as error:
         print(f"错误：{error}", file=sys.stderr)
@@ -280,14 +336,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     except OSError as error:
         print(f"系统错误：{error}", file=sys.stderr)
         return 1
-    finally:
-        if fonts_dir is not None:
-            extract.remove_directory(fonts_dir, warn_on_error=True)
-        if burn_subtitle is not None:
-            extract.remove_outputs(
-                burn_subtitle_outputs,
-                warn_on_error=True,
-            )
 
 
 if __name__ == "__main__":

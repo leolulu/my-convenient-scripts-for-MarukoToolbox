@@ -293,7 +293,7 @@ class WorkflowFontCleanupTests(unittest.TestCase):
             (fonts_dir / "font.ttf").write_bytes(b"font")
 
             args = Namespace(
-                mkv=mkv,
+                inputs=[mkv],
                 output=output,
                 crf=24.0,
                 audio_bitrate=128,

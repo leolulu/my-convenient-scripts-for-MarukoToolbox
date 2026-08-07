@@ -46,6 +46,115 @@ class CommandLineTests(unittest.TestCase):
                 )
 
 
+class BatchCliTests(unittest.TestCase):
+    def test_expand_inputs_expands_top_level_mkv_files_only(self) -> None:
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as temp_dir:
+            root = Path(temp_dir)
+            (root / "a.mkv").touch()
+            (root / "b.MKV").touch()
+            (root / "c.txt").touch()
+            nested = root / "nested"
+            nested.mkdir()
+            (nested / "d.mkv").touch()
+
+            expanded = workflow.expand_inputs([root])
+
+            names = [path.name for path in expanded]
+            self.assertEqual(names, ["a.mkv", "b.MKV"])
+            self.assertNotIn("d.mkv", names)
+
+    def test_expand_inputs_deduplicates_preserving_order(self) -> None:
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as temp_dir:
+            root = Path(temp_dir)
+            mkv = root / "a.mkv"
+            mkv.touch()
+            other = root / "other.mkv"
+            other.touch()
+
+            expanded = workflow.expand_inputs([mkv, root, mkv])
+
+            self.assertEqual(
+                [path.name for path in expanded],
+                ["a.mkv", "other.mkv"],
+            )
+
+    def test_expand_inputs_warns_and_skips_empty_directory(self) -> None:
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as temp_dir:
+            root = Path(temp_dir)
+            empty = root / "empty"
+            empty.mkdir()
+
+            with mock.patch("sys.stderr") as stderr:
+                expanded = workflow.expand_inputs([empty])
+
+            self.assertEqual(expanded, [])
+            stderr.write.assert_called()
+            self.assertIn(".mkv", "".join(c[0][0] for c in stderr.write.call_args_list))
+
+    def test_expand_inputs_fails_on_nonexistent_path(self) -> None:
+        with self.assertRaises(workflow.MkvToMp4Error):
+            workflow.expand_inputs([Path("no_such_file.mkv")])
+
+    def test_expand_inputs_fails_on_non_mkv_file(self) -> None:
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as temp_dir:
+            root = Path(temp_dir)
+            video = root / "video.mp4"
+            video.touch()
+
+            with self.assertRaises(extract.ExtractSubtitleError):
+                workflow.expand_inputs([video])
+
+    def test_is_processed_checks_default_output_and_overwrite(self) -> None:
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as temp_dir:
+            root = Path(temp_dir)
+            mkv = root / "a.mkv"
+            mkv.touch()
+            output = root / "a_x264.mp4"
+
+            no_overwrite = Namespace(overwrite=False)
+            with_overwrite = Namespace(overwrite=True)
+
+            self.assertFalse(workflow.is_processed(mkv, no_overwrite))
+
+            output.touch()
+            self.assertTrue(workflow.is_processed(mkv, no_overwrite))
+            self.assertFalse(workflow.is_processed(mkv, with_overwrite))
+
+    def test_output_flag_rejected_for_multiple_inputs(self) -> None:
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as temp_dir:
+            root = Path(temp_dir)
+            (root / "a.mkv").touch()
+            (root / "b.mkv").touch()
+
+            with mock.patch.object(workflow, "process_one"):
+                with mock.patch("sys.stderr"):
+                    exit_code = workflow.main([str(root), "-o", str(root / "out.mp4")])
+
+            self.assertEqual(exit_code, 1)
+
+    def test_main_skips_already_processed_and_counts(self) -> None:
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as temp_dir:
+            root = Path(temp_dir)
+            (root / "a.mkv").touch()
+            (root / "b.mkv").touch()
+            (root / "a_x264.mp4").touch()
+
+            processed: list[Path] = []
+            with mock.patch.object(
+                workflow,
+                "process_one",
+                side_effect=lambda _args, mkv: processed.append(mkv),
+            ):
+                with mock.patch("sys.stdout") as stdout:
+                    exit_code = workflow.main([str(root)])
+
+            self.assertEqual(exit_code, 0)
+            self.assertEqual([path.name for path in processed], ["b.mkv"])
+            output = "".join(c[0][0] for c in stdout.write.call_args_list)
+            self.assertIn("跳过 1 个已处理", output)
+            self.assertIn("成功 1 个", output)
+
+
 class CleanExportedAlignmentTagsTests(unittest.TestCase):
     def test_srt_removes_alignment_tags_and_preserves_other_override_tags(self) -> None:
         with tempfile.TemporaryDirectory(dir=Path.cwd()) as temp_dir:
@@ -155,7 +264,7 @@ class WorkflowAlignmentTagTests(unittest.TestCase):
             return 0
 
         args = Namespace(
-            mkv=mkv,
+            inputs=[mkv],
             output=output,
             crf=24.0,
             audio_bitrate=128,
