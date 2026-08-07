@@ -838,7 +838,11 @@ def remove_directory(path: Path) -> None:
         print(f"警告：无法删除临时目录 {path}：{error}", file=sys.stderr)
 
 
-def main(argv: Sequence[str] | None = None) -> int:
+def main(
+    argv: Sequence[str] | None = None,
+    *,
+    result: list | None = None,
+) -> int:
     args = build_parser().parse_args(argv)
     staged_fonts_dir: Path | None = None
 
@@ -868,6 +872,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             audio_streams,
             args.audio_language,
         )
+        if result is not None:
+            result.append(audio_stream)
 
         if args.keyint is None and frame_rate is None:
             fail("无法从 ffmpeg 输出中识别视频帧率，请使用 --keyint 手动指定关键帧间隔")

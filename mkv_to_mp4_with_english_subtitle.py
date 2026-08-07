@@ -208,8 +208,11 @@ def build_burn_arguments(
     return arguments
 
 
-def process_one(args: argparse.Namespace, mkv: Path) -> None:
-    """对单个 MKV 执行完整的识别→提取→烧录流程；失败抛 MkvToMp4Error/ExtractSubtitleError。"""
+def process_one(args: argparse.Namespace, mkv: Path) -> dict[str, object]:
+    """对单个 MKV 执行完整的识别→提取→烧录流程；失败抛 MkvToMp4Error/ExtractSubtitleError。
+
+    成功返回记录：{"mkv", "audio": burn.AudioStream|None, "subtitle": track dict}。
+    """
     burn_subtitle: Path | None = None
     exported_subtitle: Path | None = None
     burn_subtitle_outputs: list[Path] = []
@@ -269,16 +272,23 @@ def process_one(args: argparse.Namespace, mkv: Path) -> None:
             output,
             fonts_dir,
         )
-        burn_exit_code = burn.main(burn_arguments)
+        result: list = []
+        burn_exit_code = burn.main(burn_arguments, result=result)
         if burn_exit_code == 130:
             raise KeyboardInterrupt
         if burn_exit_code != 0:
             fail(f"字幕烧录流程失败，退出码：{burn_exit_code}")
+        audio_stream = result[0] if result else None
 
         print("\n========== 全部完成 ==========")
         print(f"输出 MP4：{output}")
         if exported_subtitle is not None:
             print(f"保留字幕：{exported_subtitle}")
+        return {
+            "mkv": mkv,
+            "audio": audio_stream,
+            "subtitle": track,
+        }
     finally:
         if fonts_dir is not None:
             extract.remove_directory(fonts_dir, warn_on_error=True)
@@ -334,6 +344,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         processed_skipped = 0
         succeeded = 0
         failures: list[tuple[Path, str]] = []
+        succeeded_records: list[dict[str, object]] = []
         for index, mkv in enumerate(mkvs, start=1):
             print(f"\n========== 处理 {index}/{len(mkvs)}：{mkv} ==========")
             try:
@@ -341,7 +352,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     print(f"已处理过，跳过：{mkv}")
                     processed_skipped += 1
                     continue
-                process_one(args, mkv)
+                record = process_one(args, mkv)
             except (MkvToMp4Error, extract.ExtractSubtitleError, OSError) as error:
                 reason = describe_processing_error(error)
                 failures.append((mkv, reason))
@@ -349,11 +360,30 @@ def main(argv: Sequence[str] | None = None) -> int:
                 print(f"原因：{reason}", file=sys.stderr)
                 continue
             succeeded += 1
+            succeeded_records.append(record)
         print(
             f"\n全部处理结束：共 {len(mkvs)} 个输入，"
             f"跳过 {processed_skipped} 个已处理，成功 {succeeded} 个，"
             f"失败 {len(failures)} 个。"
         )
+        if succeeded_records:
+            print("\n成功明细：")
+            for record in succeeded_records:
+                audio = record["audio"]
+                if audio is None:
+                    audio_line = "ffmpeg 自动选择（无偏好音轨）"
+                else:
+                    audio_line = f"{audio.language} (流 0:{audio.index})"
+                sub = record["subtitle"]
+                sub_props = sub.get("properties", {})
+                sub_line = (
+                    f"ID {sub.get('id')} · {sub_props.get('language', 'und')}"
+                    f" · {sub_props.get('track_name') or '无名称'}"
+                    f" · {sub.get('codec', '未知')}"
+                )
+                print(f"[{record['mkv']}]")
+                print(f"  音轨：{audio_line}")
+                print(f"  字幕：{sub_line}")
         if failures:
             print("\n失败明细：", file=sys.stderr)
             for mkv, reason in failures:

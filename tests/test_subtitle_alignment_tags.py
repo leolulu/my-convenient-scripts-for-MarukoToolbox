@@ -161,10 +161,15 @@ class BatchCliTests(unittest.TestCase):
             (root / "a_x264.mp4").touch()
 
             processed: list[Path] = []
+
+            def process_one(_args: Namespace, mkv: Path) -> dict[str, object]:
+                processed.append(mkv)
+                return {"mkv": mkv, "audio": None, "subtitle": {}}
+
             with mock.patch.object(
                 workflow,
                 "process_one",
-                side_effect=lambda _args, mkv: processed.append(mkv),
+                side_effect=process_one,
             ):
                 with mock.patch("sys.stdout") as stdout:
                     exit_code = workflow.main([str(root)])
@@ -185,7 +190,7 @@ class BatchCliTests(unittest.TestCase):
 
             processed: list[str] = []
 
-            def process(_args: Namespace, mkv: Path) -> None:
+            def process(_args: Namespace, mkv: Path) -> dict[str, object]:
                 processed.append(mkv.name)
                 if mkv.name == "a.mkv":
                     raise workflow.MkvToMp4Error("没有字幕轨")
@@ -193,6 +198,7 @@ class BatchCliTests(unittest.TestCase):
                     raise extract.ExtractSubtitleError("字幕无法提取")
                 if mkv.name == "c.mkv":
                     raise OSError("网络文件不可读")
+                return {"mkv": mkv, "audio": None, "subtitle": {}}
 
             with mock.patch.object(workflow, "process_one", side_effect=process):
                 with mock.patch("sys.stdout") as stdout, mock.patch("sys.stderr") as stderr:
@@ -331,10 +337,12 @@ class WorkflowAlignmentTagTests(unittest.TestCase):
         def write_extracted_subtitle(*_args: object) -> None:
             raw_subtitle.write_bytes(raw_content)
 
-        def burn_main(arguments: list[str]) -> int:
+        def burn_main(arguments: list[str], *, result: list | None = None) -> int:
             nonlocal burned_arguments, burned_content
             burned_arguments = arguments
             burned_content = Path(arguments[1]).read_bytes()
+            if result is not None:
+                result.append(None)
             return 0
 
         args = Namespace(
