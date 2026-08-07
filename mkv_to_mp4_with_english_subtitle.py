@@ -312,7 +312,7 @@ def expand_inputs(inputs: Sequence[Path]) -> list[Path]:
 
 def is_processed(mkv: Path, args: argparse.Namespace) -> bool:
     """输出 MP4 已存在即视为已处理。"""
-    output = burn.resolve_output(mkv, None)
+    output = burn.resolve_output(mkv, args.output)
     return output.exists() and not args.overwrite
 
 

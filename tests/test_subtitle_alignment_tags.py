@@ -119,14 +119,27 @@ class BatchCliTests(unittest.TestCase):
             mkv.touch()
             output = root / "a_x264.mp4"
 
-            no_overwrite = Namespace(overwrite=False)
-            with_overwrite = Namespace(overwrite=True)
+            no_overwrite = Namespace(overwrite=False, output=None)
+            with_overwrite = Namespace(overwrite=True, output=None)
 
             self.assertFalse(workflow.is_processed(mkv, no_overwrite))
 
             output.touch()
             self.assertTrue(workflow.is_processed(mkv, no_overwrite))
             self.assertFalse(workflow.is_processed(mkv, with_overwrite))
+
+    def test_is_processed_honors_custom_output_path(self) -> None:
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as temp_dir:
+            root = Path(temp_dir)
+            mkv = root / "a.mkv"
+            mkv.touch()
+            default_output = root / "a_x264.mp4"
+            custom_output = root / "custom.mp4"
+
+            default_output.touch()
+
+            args = Namespace(overwrite=False, output=custom_output)
+            self.assertFalse(workflow.is_processed(mkv, args))
 
     def test_output_flag_rejected_for_multiple_inputs(self) -> None:
         with tempfile.TemporaryDirectory(dir=Path.cwd()) as temp_dir:
