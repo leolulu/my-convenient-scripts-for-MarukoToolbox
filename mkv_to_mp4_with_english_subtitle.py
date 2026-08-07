@@ -51,6 +51,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="Nero AAC-LC 音频码率，默认 128 kbps",
     )
     parser.add_argument(
+        "--audio-language",
+        choices=burn.AUDIO_LANGUAGE_CHOICES,
+        default="jpn",
+        metavar="{jpn,eng}",
+        help="多音轨时优先选择的语言：jpn=日语，eng=英语；默认 jpn",
+    )
+    parser.add_argument(
         "--keyint",
         type=burn.positive_int,
         help="x264 最大关键帧间隔；默认按输入帧率的 10 秒自动计算",
@@ -185,6 +192,8 @@ def build_burn_arguments(
         str(args.crf),
         "--audio-bitrate",
         str(args.audio_bitrate),
+        "--audio-language",
+        args.audio_language,
     ]
     if args.keyint is not None:
         arguments.extend(("--keyint", str(args.keyint)))

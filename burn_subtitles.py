@@ -13,7 +13,7 @@ import sys
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import NoReturn, Sequence
+from typing import NamedTuple, NoReturn, Sequence
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -31,8 +31,25 @@ MEDIAINFO = (
     else TOOLS_DIR / "MediaInfo.dll"
 )
 
+AUDIO_LANGUAGE_CHOICES = ("jpn", "eng")
+AUDIO_LANGUAGE_NAMES = {
+    "jpn": "日语",
+    "eng": "英语",
+}
+AUDIO_LANGUAGE_ALIASES = {
+    "jpn": {"ja", "jpn", "japanese"},
+    "eng": {"en", "eng", "english"},
+}
+
 VIDEO_STREAM_RE = re.compile(r"^\s*Stream .+Video:", re.MULTILINE)
 AUDIO_STREAM_RE = re.compile(r"^\s*Stream .+Audio:", re.MULTILINE)
+AUDIO_STREAM_DETAILS_RE = re.compile(
+    r"^\s*Stream #0:(?P<index>\d+)"
+    r"(?:\[[^\]\r\n]+\])?"
+    r"(?:\((?P<language>[^)\r\n]+)\))?"
+    r":\s*Audio:(?P<details>.*)$",
+    re.IGNORECASE | re.MULTILINE,
+)
 FPS_RE = re.compile(r"(?:,|\s)(\d+(?:\.\d+)?)\s*fps(?:,|\s)", re.IGNORECASE)
 TBR_RE = re.compile(r"(?:,|\s)(\d+(?:\.\d+)?)\s*tbr(?:,|\s)", re.IGNORECASE)
 
@@ -95,6 +112,12 @@ class VideoColorInfo:
     matrix_coefficients: str | None
 
 
+class AudioStream(NamedTuple):
+    index: int
+    language: str
+    default: bool
+
+
 def positive_int(value: str) -> int:
     number = int(value)
     if number <= 0:
@@ -136,6 +159,13 @@ def build_parser() -> argparse.ArgumentParser:
         default=128,
         metavar="KBPS",
         help="Nero AAC-LC 音频码率，默认 128 kbps",
+    )
+    parser.add_argument(
+        "--audio-language",
+        choices=AUDIO_LANGUAGE_CHOICES,
+        default="jpn",
+        metavar="{jpn,eng}",
+        help="多音轨时优先选择的语言：jpn=日语，eng=英语；默认 jpn",
     )
     parser.add_argument(
         "--keyint",
@@ -288,6 +318,71 @@ def run_command(command: Sequence[os.PathLike[str] | str], stage: str) -> None:
         fail(f"{stage}失败，退出码：{result.returncode}")
 
 
+def parse_audio_streams(probe_text: str) -> list[AudioStream]:
+    streams = []
+    for match in AUDIO_STREAM_DETAILS_RE.finditer(probe_text):
+        streams.append(
+            AudioStream(
+                index=int(match.group("index")),
+                language=(match.group("language") or "und").strip().lower(),
+                default="(default)" in match.group("details").lower(),
+            )
+        )
+    return streams
+
+
+def matches_audio_language(language: str, preferred_language: str) -> bool:
+    normalized = language.strip().lower().replace("_", "-")
+    aliases = AUDIO_LANGUAGE_ALIASES[preferred_language]
+    return normalized in aliases or normalized.split("-", 1)[0] in aliases
+
+
+def select_audio_stream(
+    audio_streams: list[AudioStream],
+    preferred_language: str,
+) -> tuple[AudioStream | None, str]:
+    preferred_name = AUDIO_LANGUAGE_NAMES[preferred_language]
+    if not audio_streams:
+        return (
+            None,
+            f"无法解析音轨索引，无法按{preferred_name}偏好选择；"
+            "继续使用 ffmpeg 原有自动选择规则。",
+        )
+
+    if len(audio_streams) == 1:
+        selected = audio_streams[0]
+        return (
+            selected,
+            f"只有一条音轨，使用流 0:{selected.index}"
+            f"（语言 {selected.language}）。",
+        )
+
+    preferred_streams = [
+        stream
+        for stream in audio_streams
+        if matches_audio_language(stream.language, preferred_language)
+    ]
+    if not preferred_streams:
+        languages = ", ".join(stream.language for stream in audio_streams)
+        return (
+            None,
+            f"检测到 {len(audio_streams)} 条音轨，但没有识别到{preferred_name}音轨"
+            f"（现有语言：{languages}）；继续使用 ffmpeg 原有自动选择规则。",
+        )
+
+    selected = min(
+        preferred_streams,
+        key=lambda stream: (not stream.default, stream.index),
+    )
+    return (
+        selected,
+        f"检测到 {len(audio_streams)} 条音轨，其中 "
+        f"{len(preferred_streams)} 条识别为{preferred_name}；"
+        f"使用流 0:{selected.index}（语言 {selected.language}"
+        f"{'，默认轨' if selected.default else ''}）。",
+    )
+
+
 def normalize_mediainfo_value(value: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", value.casefold())
 
@@ -385,7 +480,15 @@ def build_x264_color_options(color_info: VideoColorInfo) -> list[str]:
     return options
 
 
-def probe_video(video: Path) -> tuple[float | None, bool, bool, VideoColorInfo]:
+def probe_video(
+    video: Path,
+) -> tuple[
+    float | None,
+    bool,
+    bool,
+    VideoColorInfo,
+    list[AudioStream],
+]:
     command = [FFMPEG, "-i", video]
     result = subprocess.run(
         command,
@@ -419,6 +522,7 @@ def probe_video(video: Path) -> tuple[float | None, bool, bool, VideoColorInfo]:
         bool(AUDIO_STREAM_RE.search(probe_text)),
         bundled_decoder_supported,
         probe_video_color(video),
+        parse_audio_streams(probe_text),
     )
 
 
@@ -471,21 +575,40 @@ def validate_fallback_decoder(fallback_ffmpeg: Path, video: Path) -> None:
         fail(f"外部 ffmpeg 无法解码输入视频，退出码：{result.returncode}{details}")
 
 
-def encode_audio(video: Path, audio_temp: Path, bitrate_kbps: int) -> None:
-    ffmpeg_command = [
+def build_audio_decode_command(
+    video: Path,
+    audio_stream: AudioStream | None,
+) -> list[Path | str]:
+    command: list[Path | str] = [
         FFMPEG,
         "-i",
         video,
-        "-vn",
-        "-sn",
-        "-v",
-        "0",
-        "-c:a",
-        "pcm_s16le",
-        "-f",
-        "wav",
-        "pipe:",
     ]
+    if audio_stream is not None:
+        command.extend(("-map", f"0:{audio_stream.index}"))
+    command.extend(
+        (
+            "-vn",
+            "-sn",
+            "-v",
+            "0",
+            "-c:a",
+            "pcm_s16le",
+            "-f",
+            "wav",
+            "pipe:",
+        )
+    )
+    return command
+
+
+def encode_audio(
+    video: Path,
+    audio_temp: Path,
+    bitrate_kbps: int,
+    audio_stream: AudioStream | None = None,
+) -> None:
+    ffmpeg_command = build_audio_decode_command(video, audio_stream)
     nero_command = [
         NERO_AAC,
         "-ignorelength",
@@ -737,9 +860,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             has_audio,
             bundled_decoder_supported,
             color_info,
+            audio_streams,
         ) = probe_video(video)
         if not has_audio:
             fail("输入视频不包含音频流，当前脚本无法执行“压制音频”流程")
+        audio_stream, audio_selection = select_audio_stream(
+            audio_streams,
+            args.audio_language,
+        )
 
         if args.keyint is None and frame_rate is None:
             fail("无法从 ffmpeg 输出中识别视频帧率，请使用 --keyint 手动指定关键帧间隔")
@@ -754,6 +882,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(f"检测帧率：无法识别；使用指定的关键帧间隔：{keyint}")
         else:
             print(f"检测帧率：{frame_rate:g} fps；关键帧间隔：{keyint}")
+        print(
+            f"目标音轨语言：{AUDIO_LANGUAGE_NAMES[args.audio_language]}"
+            f"（{args.audio_language}）"
+        )
+        print(f"音轨选择：{audio_selection}")
         print(
             "检测色彩："
             f"range={color_info.color_range or 'unknown'}，"
@@ -776,7 +909,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         completed = False
         mux_started = False
         try:
-            encode_audio(video, audio_temp, args.audio_bitrate)
+            encode_audio(video, audio_temp, args.audio_bitrate, audio_stream)
             encode_video(
                 video,
                 subtitle,
