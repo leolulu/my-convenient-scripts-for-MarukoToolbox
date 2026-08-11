@@ -20,6 +20,22 @@ def _audio_stream(index: int, language: str, default: bool = False):
     return workflow.burn.AudioStream(index=index, language=language, default=default)
 
 
+def _result(
+    subtitle_line: str = "ID 2 eng（英语）",
+    audio_line: str = "0:1 jpn（日语）",
+    subtitle_status: str = "selected",
+    audio_status: str = "selected",
+    failure_reasons: tuple[str, ...] = (),
+) -> workflow.DryRunResult:
+    return workflow.DryRunResult(
+        subtitle_line=subtitle_line,
+        audio_line=audio_line,
+        subtitle_status=subtitle_status,
+        audio_status=audio_status,
+        failure_reasons=failure_reasons,
+    )
+
+
 class DryRunOneTests(unittest.TestCase):
     def setUp(self) -> None:
         self.args = argparse.Namespace(audio_language="jpn")
@@ -34,14 +50,16 @@ class DryRunOneTests(unittest.TestCase):
             mock.patch.object(workflow.extract, "identify_tracks", return_value=tracks),
             mock.patch.object(workflow.burn, "probe_video", return_value=(None, True, True, None, [_audio_stream(1, "jpn")])),
         ):
-            subtitle_line, audio_line, read_failed = workflow.dry_run_one(
+            result = workflow.dry_run_one(
                 self.args,
                 self.mkv,
             )
 
-        self.assertEqual(subtitle_line, "ID 2 eng(英语)")
-        self.assertEqual(audio_line, "0:1 jpn(日语)")
-        self.assertFalse(read_failed)
+        self.assertEqual(result.subtitle_line, "ID 2 eng（英语）")
+        self.assertEqual(result.audio_line, "0:1 jpn（日语）")
+        self.assertEqual(result.subtitle_status, "selected")
+        self.assertEqual(result.audio_status, "selected")
+        self.assertFalse(result.failed)
 
     def test_subtitle_miss_lists_existing_languages(self) -> None:
         tracks = [_subtitle_track(1, "jpn"), _subtitle_track(3, "chs")]
@@ -49,26 +67,28 @@ class DryRunOneTests(unittest.TestCase):
             mock.patch.object(workflow.extract, "identify_tracks", return_value=tracks),
             mock.patch.object(workflow.burn, "probe_video", return_value=(None, True, True, None, [_audio_stream(1, "jpn")])),
         ):
-            subtitle_line, _, read_failed = workflow.dry_run_one(
+            result = workflow.dry_run_one(
                 self.args,
                 self.mkv,
             )
 
-        self.assertEqual(subtitle_line, "无 enm/eng(现有: chs, jpn)")
-        self.assertFalse(read_failed)
+        self.assertEqual(result.subtitle_line, "无 enm/eng（现有：chs、jpn）")
+        self.assertEqual(result.subtitle_status, "no_match")
+        self.assertFalse(result.failed)
 
-    def test_subtitle_no_tracks_reports_unknown(self) -> None:
+    def test_subtitle_no_tracks_reports_no_subtitle_stream(self) -> None:
         with (
             mock.patch.object(workflow.extract, "identify_tracks", return_value=[]),
             mock.patch.object(workflow.burn, "probe_video", return_value=(None, True, True, None, [_audio_stream(1, "jpn")])),
         ):
-            subtitle_line, _, read_failed = workflow.dry_run_one(
+            result = workflow.dry_run_one(
                 self.args,
                 self.mkv,
             )
 
-        self.assertEqual(subtitle_line, "无 enm/eng(现有: 未知)")
-        self.assertFalse(read_failed)
+        self.assertEqual(result.subtitle_line, "无字幕轨")
+        self.assertEqual(result.subtitle_status, "no_track")
+        self.assertFalse(result.failed)
 
     def test_audio_miss_reports_ffmpeg_fallback(self) -> None:
         tracks = [_subtitle_track(2, "eng")]
@@ -76,13 +96,17 @@ class DryRunOneTests(unittest.TestCase):
             mock.patch.object(workflow.extract, "identify_tracks", return_value=tracks),
             mock.patch.object(workflow.burn, "probe_video", return_value=(None, True, True, None, [_audio_stream(1, "eng"), _audio_stream(2, "chi")])),
         ):
-            _, audio_line, read_failed = workflow.dry_run_one(
+            result = workflow.dry_run_one(
                 self.args,
                 self.mkv,
             )
 
-        self.assertEqual(audio_line, "无 jpn(现有: eng, chi) → ffmpeg 自动选")
-        self.assertFalse(read_failed)
+        self.assertEqual(
+            result.audio_line,
+            "无 jpn（现有：eng、chi）→ ffmpeg 自动选",
+        )
+        self.assertEqual(result.audio_status, "fallback")
+        self.assertFalse(result.failed)
 
     def test_audio_language_preference_is_respected(self) -> None:
         tracks = [_subtitle_track(2, "eng")]
@@ -95,13 +119,14 @@ class DryRunOneTests(unittest.TestCase):
                 return_value=(None, True, True, None, [_audio_stream(1, "jpn"), _audio_stream(2, "eng")]),
             ),
         ):
-            _, audio_line, read_failed = workflow.dry_run_one(
+            result = workflow.dry_run_one(
                 eng_args,
                 self.mkv,
             )
 
-        self.assertEqual(audio_line, "0:2 eng(英语)")
-        self.assertFalse(read_failed)
+        self.assertEqual(result.audio_line, "0:2 eng（英语）")
+        self.assertEqual(result.audio_status, "selected")
+        self.assertFalse(result.failed)
 
     def test_missing_ffmpeg_reports_undetected(self) -> None:
         tracks = [_subtitle_track(2, "eng")]
@@ -109,13 +134,14 @@ class DryRunOneTests(unittest.TestCase):
             mock.patch.object(workflow.extract, "identify_tracks", return_value=tracks),
             mock.patch.object(workflow.burn, "FFMPEG", Path("nonexistent.exe")),
         ):
-            _, audio_line, read_failed = workflow.dry_run_one(
+            result = workflow.dry_run_one(
                 self.args,
                 self.mkv,
             )
 
-        self.assertEqual(audio_line, "未探测(缺 ffmpeg)")
-        self.assertFalse(read_failed)
+        self.assertEqual(result.audio_line, "未探测（缺 ffmpeg）")
+        self.assertEqual(result.audio_status, "unprobed")
+        self.assertFalse(result.failed)
 
     def test_no_audio_stream_reports_truthfully(self) -> None:
         tracks = [_subtitle_track(2, "eng")]
@@ -127,13 +153,14 @@ class DryRunOneTests(unittest.TestCase):
                 return_value=(None, False, True, None, []),
             ),
         ):
-            _, audio_line, read_failed = workflow.dry_run_one(
+            result = workflow.dry_run_one(
                 self.args,
                 self.mkv,
             )
 
-        self.assertEqual(audio_line, "无音频流")
-        self.assertFalse(read_failed)
+        self.assertEqual(result.audio_line, "无音频流")
+        self.assertEqual(result.audio_status, "no_track")
+        self.assertFalse(result.failed)
 
 
 class DryRunMainTests(unittest.TestCase):
@@ -149,7 +176,7 @@ class DryRunMainTests(unittest.TestCase):
             mock.patch.object(
                 workflow,
                 "dry_run_one",
-                return_value=("ID 2 eng(英语)", "0:1 jpn(日语)", False),
+                return_value=_result(),
             ) as dry_run_one,
             mock.patch("sys.stdout", new_callable=StringIO) as stdout,
         ):
@@ -160,12 +187,17 @@ class DryRunMainTests(unittest.TestCase):
         inspected = [call.args[1] for call in dry_run_one.call_args_list]
         self.assertEqual(inspected, mkvs)
         output = stdout.getvalue()
-        self.assertIn("[1] already.mkv [已有处理结果]", output)
-        self.assertIn("[2] pending.mkv\t字幕:", output)
+        self.assertIn("\n[1] already.mkv [已有处理结果]\n", output)
+        self.assertIn("\n[2] pending.mkv\n", output)
+        self.assertIn("    字幕：ID 2 eng（英语）\n", output)
+        self.assertIn("    音轨：0:1 jpn（日语）\n", output)
+        self.assertNotIn("\t", output)
         self.assertNotIn("已处理过，跳过", output)
-        self.assertIn("字幕选中 2/2", output)
-        self.assertIn("音轨命中 2/2", output)
-        self.assertIn("读取失败 0", output)
+        self.assertIn("预检汇总：共 2 个文件", output)
+        self.assertIn("字幕和音轨均选中：2", output)
+        self.assertIn("处理失败：0", output)
+        self.assertEqual(output.count("already.mkv"), 1)
+        self.assertEqual(output.count("pending.mkv"), 1)
 
     def test_main_attributes_audio_probe_failure_to_audio_column(self) -> None:
         tracks = [_subtitle_track(2, "eng")]
@@ -196,12 +228,13 @@ class DryRunMainTests(unittest.TestCase):
 
         self.assertEqual(exit_code, 1)
         output = stdout.getvalue()
-        self.assertIn("字幕: ID 2 eng(英语)", output)
-        self.assertIn("音轨: 探测失败(ffmpeg 未检测到视频流)", output)
-        self.assertNotIn("字幕: 读取失败", output)
-        self.assertIn("字幕选中 1/1", output)
-        self.assertIn("音轨命中 0/1", output)
-        self.assertIn("读取失败 1", output)
+        self.assertIn("字幕：ID 2 eng（英语）", output)
+        self.assertIn("音轨：探测失败（ffmpeg 未检测到视频流）", output)
+        self.assertNotIn("字幕：读取失败", output)
+        self.assertIn("字幕和音轨均选中：0", output)
+        self.assertIn("仅字幕选中：0", output)
+        self.assertIn("处理失败：1", output)
+        self.assertEqual(output.count("broken.mkv"), 1)
 
     def test_main_counts_output_status_failure_and_still_inspects(self) -> None:
         with (
@@ -218,7 +251,7 @@ class DryRunMainTests(unittest.TestCase):
             mock.patch.object(
                 workflow,
                 "dry_run_one",
-                return_value=("ID 2 eng(英语)", "0:1 jpn(日语)", False),
+                return_value=_result(),
             ) as dry_run_one,
             mock.patch("sys.stdout", new_callable=StringIO) as stdout,
         ):
@@ -227,12 +260,74 @@ class DryRunMainTests(unittest.TestCase):
         self.assertEqual(exit_code, 1)
         dry_run_one.assert_called_once()
         output = stdout.getvalue()
-        self.assertIn("处理结果状态检查失败(系统错误：无法读取输出目录)", output)
-        self.assertIn("字幕: ID 2 eng(英语)", output)
-        self.assertIn("音轨: 0:1 jpn(日语)", output)
-        self.assertIn("字幕选中 1/1", output)
-        self.assertIn("音轨命中 1/1", output)
-        self.assertIn("读取失败 1", output)
+        self.assertIn("处理结果状态检查失败（系统错误：无法读取输出目录）", output)
+        self.assertIn("字幕：ID 2 eng（英语）", output)
+        self.assertIn("音轨：0:1 jpn（日语）", output)
+        self.assertIn("字幕和音轨均选中：0", output)
+        self.assertIn("处理失败：1", output)
+        self.assertEqual(output.count("status-error.mkv"), 1)
+
+    def test_main_groups_files_by_combined_selection_result(self) -> None:
+        mkvs = [
+            Path("both.mkv"),
+            Path("subtitle-only.mkv"),
+            Path("audio-only.mkv"),
+            Path("neither.mkv"),
+            Path("failed.mkv"),
+        ]
+        results = [
+            _result(),
+            _result(
+                audio_line="无 jpn（现有：eng、chi）→ ffmpeg 自动选",
+                audio_status="fallback",
+            ),
+            _result(
+                subtitle_line="无字幕轨",
+                subtitle_status="no_track",
+            ),
+            _result(
+                subtitle_line="无 enm/eng（现有：jpn）",
+                audio_line="无音频流",
+                subtitle_status="no_match",
+                audio_status="no_track",
+            ),
+            _result(
+                subtitle_line="读取失败（字幕提取错误：损坏）",
+                subtitle_status="failed",
+                failure_reasons=("字幕读取失败：字幕提取错误：损坏",),
+            ),
+        ]
+        with (
+            mock.patch.object(workflow, "expand_inputs", return_value=mkvs),
+            mock.patch.object(
+                workflow,
+                "has_processed_output",
+                return_value=False,
+            ),
+            mock.patch.object(
+                workflow,
+                "dry_run_one",
+                side_effect=results,
+            ),
+            mock.patch("sys.stdout", new_callable=StringIO) as stdout,
+        ):
+            exit_code = workflow.main(["input", "--dry-run"])
+
+        self.assertEqual(exit_code, 1)
+        output = stdout.getvalue()
+        self.assertIn("预检汇总：共 5 个文件", output)
+        self.assertIn("字幕和音轨均选中：1", output)
+        self.assertIn("仅字幕选中：1", output)
+        self.assertIn("仅音轨选中：1", output)
+        self.assertIn("字幕和音轨均未选中：1", output)
+        self.assertIn("处理失败：1", output)
+        for mkv in mkvs:
+            self.assertEqual(output.count(mkv.name), 1)
+        self.assertIn("音轨：无 jpn（现有：eng、chi）→ ffmpeg 自动选", output)
+        self.assertIn("字幕：无字幕轨", output)
+        self.assertIn("字幕：无 enm/eng（现有：jpn）", output)
+        self.assertIn("音轨：无音频流", output)
+        self.assertIn("字幕：读取失败（字幕提取错误：损坏）", output)
 
     def test_main_reports_no_audio_without_ffmpeg_fallback(self) -> None:
         tracks = [_subtitle_track(2, "eng")]
@@ -261,11 +356,11 @@ class DryRunMainTests(unittest.TestCase):
 
         self.assertEqual(exit_code, 0)
         output = stdout.getvalue()
-        self.assertIn("音轨: 无音频流", output)
+        self.assertIn("音轨：无音频流", output)
         self.assertNotIn("ffmpeg 自动选", output)
-        self.assertIn("字幕选中 1/1", output)
-        self.assertIn("音轨命中 0/1", output)
-        self.assertIn("读取失败 0", output)
+        self.assertIn("仅字幕选中：1", output)
+        self.assertIn("处理失败：0", output)
+        self.assertEqual(output.count("silent.mkv"), 1)
 
 
 if __name__ == "__main__":
