@@ -85,6 +85,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="保留压制流程在小丸 temp 目录中生成的中间音视频",
     )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="只做预检：识别每个文件的音轨与字幕选择结果并打印，不执行提取/烧录",
+    )
     return parser
 
 
@@ -208,6 +213,84 @@ def build_burn_arguments(
     return arguments
 
 
+def _audio_language_label(language: str) -> str:
+    """将音轨语言码映射为可读中文名；优先按偏好的 aliases 反查，其次 extract 表，最后原码。"""
+    for pref_code, pref_name in burn.AUDIO_LANGUAGE_NAMES.items():
+        if burn.matches_audio_language(language, pref_code):
+            return pref_name
+    name = extract.describe_language(language)
+    if name != "未知语言代码":
+        return name
+    return language
+
+
+def dry_run_one(args: argparse.Namespace, mkv: Path) -> tuple[str, str, bool]:
+    """只读预检单个 MKV，返回字幕列、音轨列和是否发生读取失败。"""
+    read_failed = False
+    try:
+        subtitle_tracks = [
+            track
+            for track in extract.identify_tracks(mkv)
+            if track.get("type") == "subtitles"
+        ]
+        track, _ = extract.select_subtitle(subtitle_tracks)
+        if track is None:
+            available = sorted(
+                {
+                    str(item.get("properties", {}).get("language", "und"))
+                    for item in subtitle_tracks
+                }
+            )
+            subtitle_line = (
+                f"无 enm/eng(现有: {', '.join(available)})"
+                if available
+                else "无 enm/eng(现有: 未知)"
+            )
+        else:
+            props = track.get("properties", {})
+            language = str(props.get("language", "und"))
+            subtitle_line = (
+                f"ID {track.get('id')} {language}"
+                f"({extract.describe_language(language)})"
+            )
+    except (extract.ExtractSubtitleError, OSError) as error:
+        subtitle_line = f"读取失败({describe_processing_error(error)})"
+        read_failed = True
+
+    if not burn.FFMPEG.is_file():
+        audio_line = "未探测(缺 ffmpeg)"
+    else:
+        try:
+            _, has_audio, _, _, audio_streams = burn.probe_video(mkv)
+            if not has_audio:
+                audio_line = "无音频流"
+            else:
+                audio, _ = burn.select_audio_stream(
+                    audio_streams,
+                    args.audio_language,
+                )
+                if audio is None:
+                    existing = ", ".join(
+                        stream.language for stream in audio_streams
+                    )
+                    audio_line = (
+                        f"无 {args.audio_language}(现有: {existing}) → "
+                        "ffmpeg 自动选"
+                        if existing
+                        else f"无 {args.audio_language}(现有: 未知) → "
+                        "ffmpeg 自动选"
+                    )
+                else:
+                    audio_line = (
+                        f"0:{audio.index} {audio.language}"
+                        f"({_audio_language_label(audio.language)})"
+                    )
+        except (burn.BurnSubtitlesError, OSError) as error:
+            audio_line = f"探测失败({describe_processing_error(error)})"
+            read_failed = True
+    return subtitle_line, audio_line, read_failed
+
+
 def process_one(args: argparse.Namespace, mkv: Path) -> dict[str, object]:
     """对单个 MKV 执行完整的识别→提取→烧录流程；失败抛 MkvToMp4Error/ExtractSubtitleError。
 
@@ -320,10 +403,10 @@ def expand_inputs(inputs: Sequence[Path]) -> list[Path]:
     return list(dict.fromkeys(expanded))
 
 
-def is_processed(mkv: Path, args: argparse.Namespace) -> bool:
-    """输出 MP4 已存在即视为已处理。"""
+def has_processed_output(mkv: Path, args: argparse.Namespace) -> bool:
+    """返回输入 MKV 对应的输出 MP4 是否已经存在。"""
     output = burn.resolve_output(mkv, args.output)
-    return output.exists() and not args.overwrite
+    return output.exists()
 
 
 def describe_processing_error(error: BaseException) -> str:
@@ -345,10 +428,47 @@ def main(argv: Sequence[str] | None = None) -> int:
         succeeded = 0
         failures: list[tuple[Path, str]] = []
         succeeded_records: list[dict[str, object]] = []
+        dry_run_total = 0
+        dry_run_subtitle_hit = 0
+        dry_run_audio_hit = 0
+        dry_run_failures = 0
+        if args.dry_run:
+            audio_pref = burn.AUDIO_LANGUAGE_NAMES[args.audio_language]
+            print(
+                f"Dry-run 预检：{len(mkvs)} 个输入"
+                f"（字幕按内建 enm→eng，音轨偏好={audio_pref} {args.audio_language}）"
+            )
         for index, mkv in enumerate(mkvs, start=1):
-            print(f"\n========== 处理 {index}/{len(mkvs)}：{mkv} ==========")
+            if not args.dry_run:
+                print(f"\n========== 处理 {index}/{len(mkvs)}：{mkv} ==========")
             try:
-                if is_processed(mkv, args):
+                if args.dry_run:
+                    status_failed = False
+                    try:
+                        already_processed = has_processed_output(mkv, args)
+                    except (burn.BurnSubtitlesError, OSError) as error:
+                        reason = describe_processing_error(error)
+                        processed_label = f" [处理结果状态检查失败({reason})]"
+                        status_failed = True
+                    else:
+                        processed_label = (
+                            " [已有处理结果]" if already_processed else ""
+                        )
+                    subtitle_line, audio_line, read_failed = dry_run_one(args, mkv)
+                    dry_run_total += 1
+                    if status_failed or read_failed:
+                        dry_run_failures += 1
+                    if subtitle_line.startswith("ID "):
+                        dry_run_subtitle_hit += 1
+                    if audio_line.startswith("0:"):
+                        dry_run_audio_hit += 1
+                    print(
+                        f"  [{index}] {mkv.name}{processed_label}"
+                        f"\t字幕: {subtitle_line}\t音轨: {audio_line}"
+                    )
+                    continue
+                already_processed = has_processed_output(mkv, args)
+                if already_processed and not args.overwrite:
                     print(f"已处理过，跳过：{mkv}")
                     processed_skipped += 1
                     continue
@@ -361,6 +481,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                 continue
             succeeded += 1
             succeeded_records.append(record)
+        if args.dry_run:
+            print(
+                f"\n命中汇总：字幕选中 {dry_run_subtitle_hit}/{dry_run_total} · "
+                f"音轨命中 {dry_run_audio_hit}/{dry_run_total} · "
+                f"读取失败 {dry_run_failures}"
+            )
+            return 1 if dry_run_failures else 0
         print(
             f"\n全部处理结束：共 {len(mkvs)} 个输入，"
             f"跳过 {processed_skipped} 个已处理，成功 {succeeded} 个，"

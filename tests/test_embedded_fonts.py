@@ -303,6 +303,7 @@ class WorkflowFontCleanupTests(unittest.TestCase):
                 overwrite=False,
                 no_export_subtitle=True,
                 keep_media_temp=False,
+                dry_run=False,
             )
 
             def extract_subtitle(

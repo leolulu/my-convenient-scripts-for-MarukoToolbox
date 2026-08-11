@@ -112,23 +112,21 @@ class BatchCliTests(unittest.TestCase):
             with self.assertRaises(extract.ExtractSubtitleError):
                 workflow.expand_inputs([video])
 
-    def test_is_processed_checks_default_output_and_overwrite(self) -> None:
+    def test_has_processed_output_checks_default_output(self) -> None:
         with tempfile.TemporaryDirectory(dir=Path.cwd()) as temp_dir:
             root = Path(temp_dir)
             mkv = root / "a.mkv"
             mkv.touch()
             output = root / "a_x264.mp4"
 
-            no_overwrite = Namespace(overwrite=False, output=None)
-            with_overwrite = Namespace(overwrite=True, output=None)
+            args = Namespace(output=None)
 
-            self.assertFalse(workflow.is_processed(mkv, no_overwrite))
+            self.assertFalse(workflow.has_processed_output(mkv, args))
 
             output.touch()
-            self.assertTrue(workflow.is_processed(mkv, no_overwrite))
-            self.assertFalse(workflow.is_processed(mkv, with_overwrite))
+            self.assertTrue(workflow.has_processed_output(mkv, args))
 
-    def test_is_processed_honors_custom_output_path(self) -> None:
+    def test_has_processed_output_honors_custom_output_path(self) -> None:
         with tempfile.TemporaryDirectory(dir=Path.cwd()) as temp_dir:
             root = Path(temp_dir)
             mkv = root / "a.mkv"
@@ -138,8 +136,8 @@ class BatchCliTests(unittest.TestCase):
 
             default_output.touch()
 
-            args = Namespace(overwrite=False, output=custom_output)
-            self.assertFalse(workflow.is_processed(mkv, args))
+            args = Namespace(output=custom_output)
+            self.assertFalse(workflow.has_processed_output(mkv, args))
 
     def test_output_flag_rejected_for_multiple_inputs(self) -> None:
         with tempfile.TemporaryDirectory(dir=Path.cwd()) as temp_dir:
@@ -356,6 +354,7 @@ class WorkflowAlignmentTagTests(unittest.TestCase):
             overwrite=False,
             no_export_subtitle=False,
             keep_media_temp=False,
+            dry_run=False,
         )
 
         with (
