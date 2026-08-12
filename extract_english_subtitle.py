@@ -14,6 +14,8 @@ import uuid
 from pathlib import Path
 from typing import Any, NoReturn, Sequence
 
+from graceful_stop import run_process
+
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 ROOT_DIR = SCRIPT_DIR.parent
@@ -118,7 +120,7 @@ def validate_binaries() -> None:
 
 def identify_mkv(mkv: Path) -> dict[str, Any]:
     command = [MKVMERGE, "-J", mkv]
-    result = subprocess.run(
+    result = run_process(
         command,
         cwd=ROOT_DIR,
         stdout=subprocess.PIPE,
@@ -207,7 +209,7 @@ def extract_font_attachments(
     print("执行字体提取命令：")
     print(subprocess.list2cmdline([os.fspath(argument) for argument in command]), flush=True)
 
-    result = subprocess.run(
+    result = run_process(
         command,
         cwd=ROOT_DIR,
         stdout=subprocess.PIPE,
@@ -350,7 +352,7 @@ def extract_subtitle(mkv: Path, track: dict[str, Any], output: Path) -> None:
     print("执行命令：")
     print(subprocess.list2cmdline([str(argument) for argument in command]), flush=True)
 
-    result = subprocess.run(
+    result = run_process(
         command,
         cwd=ROOT_DIR,
         stdout=subprocess.PIPE,

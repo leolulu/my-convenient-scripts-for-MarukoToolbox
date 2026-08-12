@@ -270,11 +270,66 @@ class BatchCliTests(unittest.TestCase):
                 raise KeyboardInterrupt
 
             with mock.patch.object(workflow, "process_one", side_effect=process):
-                with mock.patch("sys.stderr"):
+                with mock.patch("sys.stderr") as stderr:
                     exit_code = workflow.main([str(root)])
 
             self.assertEqual(exit_code, 130)
             self.assertEqual(processed, ["a.mkv"])
+            summary = "".join(c[0][0] for c in stderr.write.call_args_list)
+            self.assertIn("批次中断汇总：共 2 个文件", summary)
+            self.assertIn("当前被中断 1 个", summary)
+            self.assertIn("尚未开始 1 个", summary)
+            self.assertIn(str((root / "a.mkv").resolve()), summary)
+            self.assertIn(str((root / "b.mkv").resolve()), summary)
+
+    def test_interrupted_batch_summary_covers_every_file_status(self) -> None:
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as temp_dir:
+            root = Path(temp_dir)
+            for name in ("a.mkv", "b.mkv", "c.mkv", "d.mkv", "e.mkv"):
+                (root / name).touch()
+            (root / "b.mp4").touch()
+
+            def process(_args: Namespace, mkv: Path) -> dict[str, object]:
+                if mkv.name == "c.mkv":
+                    raise workflow.MkvToMp4Error("simulated failure")
+                if mkv.name == "d.mkv":
+                    raise KeyboardInterrupt
+                return {"mkv": mkv, "audio": None, "subtitle": {}}
+
+            with (
+                mock.patch.object(workflow, "process_one", side_effect=process),
+                mock.patch("sys.stdout"),
+                mock.patch("sys.stderr") as stderr,
+            ):
+                exit_code = workflow.main([str(root)])
+
+            self.assertEqual(exit_code, 130)
+            summary = "".join(c[0][0] for c in stderr.write.call_args_list)
+            self.assertIn("本次已完成 1 个", summary)
+            self.assertIn("已有结果，已跳过 1 个", summary)
+            self.assertIn("处理失败 1 个", summary)
+            self.assertIn("当前被中断 1 个", summary)
+            self.assertIn("尚未开始 1 个", summary)
+            summary = summary[summary.index("批次中断汇总：") :]
+            for name in ("a.mkv", "b.mkv", "c.mkv", "d.mkv", "e.mkv"):
+                self.assertEqual(summary.count(str((root / name).resolve())), 1)
+
+    def test_single_file_interrupt_does_not_print_batch_summary(self) -> None:
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as temp_dir:
+            mkv = Path(temp_dir) / "single.mkv"
+            mkv.touch()
+
+            with (
+                mock.patch.object(workflow, "process_one", side_effect=KeyboardInterrupt),
+                mock.patch("sys.stdout"),
+                mock.patch("sys.stderr") as stderr,
+            ):
+                exit_code = workflow.main([str(mkv)])
+
+            self.assertEqual(exit_code, 130)
+            output = "".join(c[0][0] for c in stderr.write.call_args_list)
+            self.assertIn("已取消", output)
+            self.assertNotIn("批次中断汇总", output)
 
 
 class CleanExportedAlignmentTagsTests(unittest.TestCase):

@@ -15,6 +15,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import NamedTuple, NoReturn, Sequence
 
+from graceful_stop import (
+    announce_graceful_stop,
+    run_process,
+    start_process,
+    stop_processes,
+    wait_process,
+)
+
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 ROOT_DIR = SCRIPT_DIR.parent
@@ -313,7 +321,7 @@ def normalize_y4m_header(header: bytes) -> bytes:
 
 def run_command(command: Sequence[os.PathLike[str] | str], stage: str) -> None:
     print(f"\n[{stage}]\n{display_command(command)}", flush=True)
-    result = subprocess.run(command, cwd=ROOT_DIR, check=False)
+    result = run_process(command, cwd=ROOT_DIR, check=False)
     if result.returncode != 0:
         fail(f"{stage}失败，退出码：{result.returncode}")
 
@@ -490,7 +498,7 @@ def probe_video(
     list[AudioStream],
 ]:
     command = [FFMPEG, "-i", video]
-    result = subprocess.run(
+    result = run_process(
         command,
         cwd=ROOT_DIR,
         stdout=subprocess.DEVNULL,
@@ -561,7 +569,7 @@ def validate_fallback_decoder(fallback_ffmpeg: Path, video: Path) -> None:
         "null",
         "-",
     ]
-    result = subprocess.run(
+    result = run_process(
         command,
         cwd=ROOT_DIR,
         stdout=subprocess.DEVNULL,
@@ -627,7 +635,7 @@ def encode_audio(
         flush=True,
     )
 
-    ffmpeg_process = subprocess.Popen(
+    ffmpeg_process = start_process(
         ffmpeg_command,
         cwd=ROOT_DIR,
         stdout=subprocess.PIPE,
@@ -636,22 +644,20 @@ def encode_audio(
     nero_process: subprocess.Popen[bytes] | None = None
 
     try:
-        nero_process = subprocess.Popen(
+        nero_process = start_process(
             nero_command,
             cwd=ROOT_DIR,
             stdin=ffmpeg_process.stdout,
         )
         ffmpeg_process.stdout.close()
-        nero_returncode = nero_process.wait()
-        ffmpeg_returncode = ffmpeg_process.wait()
+        nero_returncode = wait_process(nero_process)
+        ffmpeg_returncode = wait_process(ffmpeg_process)
+    except KeyboardInterrupt:
+        announce_graceful_stop()
+        stop_processes([nero_process, ffmpeg_process])
+        raise
     except BaseException:
-        if nero_process is not None and nero_process.poll() is None:
-            nero_process.terminate()
-        if ffmpeg_process.poll() is None:
-            ffmpeg_process.terminate()
-        if nero_process is not None:
-            nero_process.wait()
-        ffmpeg_process.wait()
+        stop_processes([nero_process, ffmpeg_process])
         raise
 
     if ffmpeg_returncode != 0 or nero_returncode != 0:
@@ -759,7 +765,7 @@ def encode_video(
         flush=True,
     )
 
-    decoder_process = subprocess.Popen(
+    decoder_process = start_process(
         decoder_command,
         cwd=ROOT_DIR,
         stdout=subprocess.PIPE,
@@ -768,7 +774,7 @@ def encode_video(
     x264_process: subprocess.Popen[bytes] | None = None
 
     try:
-        x264_process = subprocess.Popen(
+        x264_process = start_process(
             x264_command,
             cwd=ROOT_DIR,
             stdin=subprocess.PIPE,
@@ -788,16 +794,14 @@ def encode_video(
                 pass
             decoder_process.stdout.close()
 
-        x264_returncode = x264_process.wait()
-        decoder_returncode = decoder_process.wait()
+        x264_returncode = wait_process(x264_process)
+        decoder_returncode = wait_process(decoder_process)
+    except KeyboardInterrupt:
+        announce_graceful_stop()
+        stop_processes([x264_process, decoder_process])
+        raise
     except BaseException:
-        if x264_process is not None and x264_process.poll() is None:
-            x264_process.terminate()
-        if decoder_process.poll() is None:
-            decoder_process.terminate()
-        if x264_process is not None:
-            x264_process.wait()
-        decoder_process.wait()
+        stop_processes([x264_process, decoder_process])
         raise
 
     if decoder_returncode != 0 or x264_returncode != 0:
@@ -836,6 +840,21 @@ def remove_directory(path: Path) -> None:
         pass
     except OSError as error:
         print(f"警告：无法删除临时目录 {path}：{error}", file=sys.stderr)
+
+
+def cleanup_media_temp_files(
+    video_temp: Path,
+    audio_temp: Path,
+    *,
+    keep_temp: bool,
+    cancelled: bool,
+) -> None:
+    """按既有保留选项清理；用户取消时始终删除当前文件的半成品。"""
+    if cancelled or not keep_temp:
+        remove_file(video_temp)
+        remove_file(audio_temp)
+    elif audio_temp.exists() or video_temp.exists():
+        print(f"\n已保留中间文件：{TEMP_DIR}")
 
 
 def main(
@@ -913,6 +932,7 @@ def main(
         video_temp = TEMP_DIR / f"{temp_id}_vtemp.mp4"
 
         completed = False
+        cancelled = False
         mux_started = False
         try:
             encode_audio(video, audio_temp, args.audio_bitrate, audio_stream)
@@ -932,12 +952,16 @@ def main(
             mux_started = True
             mux_mp4(video_temp, audio_temp, output)
             completed = True
+        except KeyboardInterrupt:
+            cancelled = True
+            raise
         finally:
-            if not args.keep_temp:
-                remove_file(video_temp)
-                remove_file(audio_temp)
-            elif audio_temp.exists() or video_temp.exists():
-                print(f"\n已保留中间文件：{TEMP_DIR}")
+            cleanup_media_temp_files(
+                video_temp,
+                audio_temp,
+                keep_temp=args.keep_temp,
+                cancelled=cancelled,
+            )
 
             if not completed and mux_started and output.exists():
                 remove_file(output)

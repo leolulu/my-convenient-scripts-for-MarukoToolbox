@@ -43,7 +43,7 @@ class FakeProcess:
         self.returncode = returncode
         self.terminated = False
 
-    def wait(self) -> int:
+    def wait(self, timeout: float | None = None) -> int:
         return self.returncode
 
     def poll(self) -> int | None:
@@ -85,8 +85,8 @@ class FontAttachmentTests(unittest.TestCase):
                 return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
 
             with mock.patch.object(
-                extract.subprocess,
-                "run",
+                extract,
+                "run_process",
                 side_effect=run_command,
             ) as run:
                 outputs = extract.extract_font_attachments(
@@ -216,8 +216,8 @@ class BurnFontsPipelineTests(unittest.TestCase):
             x264_process = FakeProcess(stdin=io.BytesIO())
 
             with mock.patch.object(
-                burn.subprocess,
-                "Popen",
+                burn,
+                "start_process",
                 side_effect=[decoder_process, x264_process],
             ) as popen:
                 burn.encode_video(
@@ -370,6 +370,91 @@ class WorkflowFontCleanupTests(unittest.TestCase):
 
         self.assertIn("--fonts-dir", arguments)
         self.assertEqual(arguments[arguments.index("--fonts-dir") + 1], "fonts")
+
+
+class GracefulCleanupTests(unittest.TestCase):
+    def test_burn_main_cancel_cleans_partial_media_with_keep_temp(self) -> None:
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as temp_dir:
+            root = Path(temp_dir)
+            video = root / "sample.mkv"
+            subtitle = root / "sample.srt"
+            video.touch()
+            subtitle.touch()
+            burn_temp = root / "temp"
+
+            def interrupt_audio(
+                _video: Path,
+                audio_temp: Path,
+                _bitrate: int,
+                _stream: burn.AudioStream | None,
+            ) -> None:
+                audio_temp.write_bytes(b"partial audio")
+                raise KeyboardInterrupt
+
+            with (
+                mock.patch.object(burn, "TEMP_DIR", burn_temp),
+                mock.patch.object(burn, "validate_binaries"),
+                mock.patch.object(
+                    burn,
+                    "probe_video",
+                    return_value=(
+                        24.0,
+                        True,
+                        True,
+                        BT709_LIMITED,
+                        [burn.AudioStream(1, "jpn", True)],
+                    ),
+                ),
+                mock.patch.object(burn, "encode_audio", side_effect=interrupt_audio),
+                mock.patch.object(burn, "encode_video") as encode_video,
+                mock.patch("sys.stdout"),
+                mock.patch("sys.stderr"),
+            ):
+                exit_code = burn.main([str(video), str(subtitle), "--keep-temp"])
+
+            self.assertEqual(exit_code, 130)
+            self.assertEqual(list(burn_temp.iterdir()), [])
+            encode_video.assert_not_called()
+
+    def test_cancel_removes_current_media_temps_even_when_keep_is_enabled(self) -> None:
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as temp_dir:
+            root = Path(temp_dir)
+            video_temp = root / "current_vtemp.mp4"
+            audio_temp = root / "current_atemp.mp4"
+            completed_previous = root / "previous_x264.mp4"
+            video_temp.write_bytes(b"partial video")
+            audio_temp.write_bytes(b"partial audio")
+            completed_previous.write_bytes(b"completed")
+
+            burn.cleanup_media_temp_files(
+                video_temp,
+                audio_temp,
+                keep_temp=True,
+                cancelled=True,
+            )
+
+            self.assertFalse(video_temp.exists())
+            self.assertFalse(audio_temp.exists())
+            self.assertEqual(completed_previous.read_bytes(), b"completed")
+
+    def test_normal_completion_still_honors_keep_temp(self) -> None:
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as temp_dir:
+            root = Path(temp_dir)
+            video_temp = root / "current_vtemp.mp4"
+            audio_temp = root / "current_atemp.mp4"
+            video_temp.touch()
+            audio_temp.touch()
+
+            with mock.patch("sys.stdout"):
+                burn.cleanup_media_temp_files(
+                    video_temp,
+                    audio_temp,
+                    keep_temp=True,
+                    cancelled=False,
+                )
+
+            self.assertTrue(video_temp.exists())
+            self.assertTrue(audio_temp.exists())
 
 
 if __name__ == "__main__":

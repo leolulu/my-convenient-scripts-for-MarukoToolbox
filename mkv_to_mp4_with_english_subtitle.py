@@ -501,10 +501,41 @@ def describe_processing_error(error: BaseException) -> str:
     return str(error)
 
 
+def print_interrupted_batch_summary(states: dict[Path, str]) -> None:
+    """打印多文件批次在 Ctrl+C 时的最终状态。"""
+    groups = (
+        ("succeeded", "本次已完成"),
+        ("skipped", "已有结果，已跳过"),
+        ("failed", "处理失败"),
+        ("interrupted", "当前被中断"),
+        ("not_started", "尚未开始"),
+    )
+    grouped = {
+        status: [path for path, current in states.items() if current == status]
+        for status, _label in groups
+    }
+    counts = "，".join(
+        f"{label} {len(grouped[status])} 个" for status, label in groups
+    )
+    print(
+        f"\n批次中断汇总：共 {len(states)} 个文件；{counts}。",
+        file=sys.stderr,
+    )
+    for status, label in groups:
+        paths = grouped[status]
+        if not paths:
+            continue
+        print(f"{label}：", file=sys.stderr)
+        for path in paths:
+            print(f"  - {path}", file=sys.stderr)
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    batch_states: dict[Path, str] = {}
     try:
         mkvs = expand_inputs(args.inputs)
+        batch_states = {mkv: "not_started" for mkv in mkvs}
         if args.output is not None and len(mkvs) != 1:
             fail("--output 仅支持单个 MKV 输入；批量或目录模式使用默认输出命名")
         processed_skipped = 0
@@ -519,6 +550,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 f"（字幕按内建 enm→eng，音轨偏好={audio_pref} {args.audio_language}）"
             )
         for index, mkv in enumerate(mkvs, start=1):
+            if not args.dry_run:
+                batch_states[mkv] = "interrupted"
             if not args.dry_run:
                 print(f"\n========== 处理 {index}/{len(mkvs)}：{mkv} ==========")
             try:
@@ -550,16 +583,19 @@ def main(argv: Sequence[str] | None = None) -> int:
                 if already_processed and not args.overwrite:
                     print(f"已处理过，跳过：{mkv}")
                     processed_skipped += 1
+                    batch_states[mkv] = "skipped"
                     continue
                 record = process_one(args, mkv)
             except (MkvToMp4Error, extract.ExtractSubtitleError, OSError) as error:
                 reason = describe_processing_error(error)
                 failures.append((mkv, reason))
+                batch_states[mkv] = "failed"
                 print(f"处理失败：{mkv}", file=sys.stderr)
                 print(f"原因：{reason}", file=sys.stderr)
                 continue
             succeeded += 1
             succeeded_records.append(record)
+            batch_states[mkv] = "succeeded"
         if args.dry_run:
             print_dry_run_summary(dry_run_records)
             return 1 if any(record.failed for record in dry_run_records) else 0
@@ -600,6 +636,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 1
     except KeyboardInterrupt:
         print("\n已取消。", file=sys.stderr)
+        if not args.dry_run and len(batch_states) > 1:
+            print_interrupted_batch_summary(batch_states)
         return 130
     except OSError as error:
         print(f"系统错误：{error}", file=sys.stderr)
