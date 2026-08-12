@@ -485,7 +485,11 @@ def expand_inputs(inputs: Sequence[Path]) -> list[Path]:
 def has_processed_output(mkv: Path, args: argparse.Namespace) -> bool:
     """返回输入 MKV 对应的输出 MP4 是否已经存在。"""
     output = burn.resolve_output(mkv, args.output)
-    return output.exists()
+    if output.exists():
+        return True
+    if args.output is None:
+        return mkv.with_suffix(".mp4").exists()
+    return False
 
 
 def describe_processing_error(error: BaseException) -> str:
@@ -538,7 +542,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                             status_failure=status_failure,
                         )
                     )
-                    print(f"\n[{index}] {mkv.name}{processed_label}")
+                    print(f"\n[{index}]{processed_label} {mkv.name}")
                     print(f"    字幕：{result.subtitle_line}")
                     print(f"    音轨：{result.audio_line}")
                     continue

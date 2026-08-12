@@ -126,18 +126,37 @@ class BatchCliTests(unittest.TestCase):
             output.touch()
             self.assertTrue(workflow.has_processed_output(mkv, args))
 
+    def test_has_processed_output_accepts_same_stem_mp4(self) -> None:
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as temp_dir:
+            root = Path(temp_dir)
+            mkv = root / "a.mkv"
+            same_stem_output = root / "a.mp4"
+            mkv.touch()
+
+            args = Namespace(output=None)
+
+            self.assertFalse(workflow.has_processed_output(mkv, args))
+
+            same_stem_output.touch()
+            self.assertTrue(workflow.has_processed_output(mkv, args))
+
     def test_has_processed_output_honors_custom_output_path(self) -> None:
         with tempfile.TemporaryDirectory(dir=Path.cwd()) as temp_dir:
             root = Path(temp_dir)
             mkv = root / "a.mkv"
             mkv.touch()
             default_output = root / "a_x264.mp4"
+            same_stem_output = root / "a.mp4"
             custom_output = root / "custom.mp4"
 
             default_output.touch()
+            same_stem_output.touch()
 
             args = Namespace(output=custom_output)
             self.assertFalse(workflow.has_processed_output(mkv, args))
+
+            custom_output.touch()
+            self.assertTrue(workflow.has_processed_output(mkv, args))
 
     def test_output_flag_rejected_for_multiple_inputs(self) -> None:
         with tempfile.TemporaryDirectory(dir=Path.cwd()) as temp_dir:
@@ -156,7 +175,7 @@ class BatchCliTests(unittest.TestCase):
             root = Path(temp_dir)
             (root / "a.mkv").touch()
             (root / "b.mkv").touch()
-            (root / "a_x264.mp4").touch()
+            (root / "a.mp4").touch()
 
             processed: list[Path] = []
 
@@ -178,6 +197,31 @@ class BatchCliTests(unittest.TestCase):
             self.assertIn("跳过 1 个已处理", output)
             self.assertIn("成功 1 个", output)
             self.assertIn("失败 0 个", output)
+
+    def test_main_overwrite_processes_same_stem_output(self) -> None:
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as temp_dir:
+            root = Path(temp_dir)
+            mkv = root / "a.mkv"
+            mkv.touch()
+            mkv.with_suffix(".mp4").touch()
+            processed: list[Path] = []
+
+            def process_one(_args: Namespace, input_mkv: Path) -> dict[str, object]:
+                processed.append(input_mkv)
+                return {"mkv": input_mkv, "audio": None, "subtitle": {}}
+
+            with (
+                mock.patch.object(
+                    workflow,
+                    "process_one",
+                    side_effect=process_one,
+                ),
+                mock.patch("sys.stdout"),
+            ):
+                exit_code = workflow.main([str(mkv), "--overwrite"])
+
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(processed, [mkv.resolve()])
 
     def test_main_continues_after_each_supported_processing_error(self) -> None:
         with tempfile.TemporaryDirectory(dir=Path.cwd()) as temp_dir:

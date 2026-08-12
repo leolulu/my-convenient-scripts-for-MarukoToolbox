@@ -1,4 +1,5 @@
 import argparse
+import tempfile
 import unittest
 from io import StringIO
 from pathlib import Path
@@ -164,6 +165,29 @@ class DryRunOneTests(unittest.TestCase):
 
 
 class DryRunMainTests(unittest.TestCase):
+    def test_main_marks_same_stem_mp4_as_existing_output(self) -> None:
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as temp_dir:
+            root = Path(temp_dir)
+            mkv = root / "already.mkv"
+            mkv.touch()
+            mkv.with_suffix(".mp4").touch()
+
+            with (
+                mock.patch.object(
+                    workflow,
+                    "dry_run_one",
+                    return_value=_result(),
+                ),
+                mock.patch("sys.stdout", new_callable=StringIO) as stdout,
+            ):
+                exit_code = workflow.main([str(mkv), "--dry-run"])
+
+            self.assertEqual(exit_code, 0)
+            self.assertIn(
+                "\n[1] [已有处理结果] already.mkv\n",
+                stdout.getvalue(),
+            )
+
     def test_main_inspects_processed_file_and_marks_existing_output(self) -> None:
         mkvs = [Path("already.mkv"), Path("pending.mkv")]
         with (
@@ -187,7 +211,7 @@ class DryRunMainTests(unittest.TestCase):
         inspected = [call.args[1] for call in dry_run_one.call_args_list]
         self.assertEqual(inspected, mkvs)
         output = stdout.getvalue()
-        self.assertIn("\n[1] already.mkv [已有处理结果]\n", output)
+        self.assertIn("\n[1] [已有处理结果] already.mkv\n", output)
         self.assertIn("\n[2] pending.mkv\n", output)
         self.assertIn("    字幕：ID 2 eng（英语）\n", output)
         self.assertIn("    音轨：0:1 jpn（日语）\n", output)
@@ -260,7 +284,11 @@ class DryRunMainTests(unittest.TestCase):
         self.assertEqual(exit_code, 1)
         dry_run_one.assert_called_once()
         output = stdout.getvalue()
-        self.assertIn("处理结果状态检查失败（系统错误：无法读取输出目录）", output)
+        self.assertIn(
+            "\n[1] [处理结果状态检查失败（系统错误：无法读取输出目录）] "
+            "status-error.mkv\n",
+            output,
+        )
         self.assertIn("字幕：ID 2 eng（英语）", output)
         self.assertIn("音轨：0:1 jpn（日语）", output)
         self.assertIn("字幕和音轨均选中：0", output)
