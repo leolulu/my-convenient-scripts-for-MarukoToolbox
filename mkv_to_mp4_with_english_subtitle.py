@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -52,6 +53,14 @@ class DryRunRecord:
     @property
     def failed(self) -> bool:
         return self.status_failure is not None or self.result.failed
+
+
+def format_processing_duration(elapsed_seconds: float) -> str:
+    """将处理耗时格式化为累计分钟和两位秒数。"""
+
+    total_seconds = int(elapsed_seconds)
+    minutes, seconds = divmod(total_seconds, 60)
+    return f"{minutes}分{seconds:02d}秒"
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -543,6 +552,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         failures: list[tuple[Path, str]] = []
         succeeded_records: list[dict[str, object]] = []
         dry_run_records: list[DryRunRecord] = []
+        processing_started_at = time.monotonic() if not args.dry_run else None
         if args.dry_run:
             audio_pref = burn.AUDIO_LANGUAGE_NAMES[args.audio_language]
             print(
@@ -552,6 +562,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         for index, mkv in enumerate(mkvs, start=1):
             if not args.dry_run:
                 batch_states[mkv] = "interrupted"
+                file_started_at = time.monotonic()
             if not args.dry_run:
                 print(f"\n========== 处理 {index}/{len(mkvs)}：{mkv} ==========")
             try:
@@ -593,17 +604,25 @@ def main(argv: Sequence[str] | None = None) -> int:
                 print(f"处理失败：{mkv}", file=sys.stderr)
                 print(f"原因：{reason}", file=sys.stderr)
                 continue
+            record["processing_duration"] = format_processing_duration(
+                time.monotonic() - file_started_at
+            )
             succeeded += 1
             succeeded_records.append(record)
             batch_states[mkv] = "succeeded"
         if args.dry_run:
             print_dry_run_summary(dry_run_records)
             return 1 if any(record.failed for record in dry_run_records) else 0
+        assert processing_started_at is not None
+        processing_duration = format_processing_duration(
+            time.monotonic() - processing_started_at
+        )
         print(
             f"\n全部处理结束：共 {len(mkvs)} 个输入，"
             f"跳过 {processed_skipped} 个已处理，成功 {succeeded} 个，"
             f"失败 {len(failures)} 个。"
         )
+        print(f"总处理时间：{processing_duration}")
         if succeeded_records:
             print("\n成功明细：")
             for record in succeeded_records:
@@ -620,6 +639,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     f" · {sub.get('codec', '未知')}"
                 )
                 print(f"[{record['mkv']}]")
+                print(f"  处理时间：{record['processing_duration']}")
                 print(f"  音轨：{audio_line}")
                 print(f"  字幕：{sub_line}")
         if failures:

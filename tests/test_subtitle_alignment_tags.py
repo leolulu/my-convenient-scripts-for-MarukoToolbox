@@ -223,6 +223,35 @@ class BatchCliTests(unittest.TestCase):
             self.assertEqual(exit_code, 0)
             self.assertEqual(processed, [mkv.resolve()])
 
+    def test_main_prints_total_and_per_file_processing_duration(self) -> None:
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as temp_dir:
+            root = Path(temp_dir)
+            first = root / "a.mkv"
+            second = root / "b.mkv"
+            first.touch()
+            second.touch()
+
+            def process_one(_args: Namespace, mkv: Path) -> dict[str, object]:
+                return {"mkv": mkv, "audio": None, "subtitle": {}}
+
+            with (
+                mock.patch.object(workflow, "process_one", side_effect=process_one),
+                mock.patch.object(
+                    workflow.time,
+                    "monotonic",
+                    side_effect=[10.0, 20.0, 85.9, 90.0, 215.9, 220.9],
+                ),
+                mock.patch("sys.stdout") as stdout,
+            ):
+                exit_code = workflow.main([str(root)])
+
+            self.assertEqual(exit_code, 0)
+            output = "".join(c[0][0] for c in stdout.write.call_args_list)
+            self.assertIn("总处理时间：3分30秒", output)
+            self.assertIn("成功明细：", output)
+            self.assertIn(f"[{first.resolve()}]\n  处理时间：1分05秒", output)
+            self.assertIn(f"[{second.resolve()}]\n  处理时间：2分05秒", output)
+
     def test_main_continues_after_each_supported_processing_error(self) -> None:
         with tempfile.TemporaryDirectory(dir=Path.cwd()) as temp_dir:
             root = Path(temp_dir)
