@@ -141,6 +141,37 @@ class BurnFontsPipelineTests(unittest.TestCase):
 
         self.assertIsNone(mapped)
 
+    def test_duplicate_mediainfo_values_are_mapped_once(self) -> None:
+        cases = (
+            ("Limited / Limited", burn.COLOR_RANGE_MAP, "色彩范围", "tv"),
+            (
+                "BT.709 / BT.709",
+                burn.COLOR_PRIMARIES_MAP,
+                "色彩原色",
+                "bt709",
+            ),
+        )
+
+        with mock.patch("sys.stderr") as stderr:
+            for value, mapping, label, expected in cases:
+                with self.subTest(value=value):
+                    self.assertEqual(
+                        burn.map_mediainfo_color_value(value, mapping, label),
+                        expected,
+                    )
+
+        stderr.write.assert_not_called()
+
+    def test_conflicting_mediainfo_values_stay_unspecified(self) -> None:
+        with mock.patch("sys.stderr"):
+            mapped = burn.map_mediainfo_color_value(
+                "BT.709 / BT.601",
+                burn.COLOR_PRIMARIES_MAP,
+                "色彩原色",
+            )
+
+        self.assertIsNone(mapped)
+
     def test_x264_color_options_include_only_known_source_values(self) -> None:
         color_info = burn.VideoColorInfo(
             color_range="pc",

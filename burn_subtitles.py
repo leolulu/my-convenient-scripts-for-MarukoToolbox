@@ -403,7 +403,19 @@ def map_mediainfo_color_value(
     if not value:
         return None
 
-    mapped = mapping.get(normalize_mediainfo_value(value))
+    normalized_values = [
+        normalize_mediainfo_value(part) for part in value.split("/")
+    ]
+    if (
+        len(normalized_values) > 1
+        and all(normalized_values)
+        and len(set(normalized_values)) == 1
+    ):
+        normalized_value = normalized_values[0]
+    else:
+        normalized_value = normalize_mediainfo_value(value)
+
+    mapped = mapping.get(normalized_value)
     if mapped is None:
         print(
             f"警告：源视频的{label}“{value}”无法映射到当前 x264，"
