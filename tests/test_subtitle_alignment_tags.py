@@ -55,6 +55,17 @@ class CommandLineTests(unittest.TestCase):
 
 
 class BatchCliTests(unittest.TestCase):
+    def test_format_processing_duration_scales_to_hours_and_days(self) -> None:
+        self.assertEqual(workflow.format_processing_duration(65.9), "1分05秒")
+        self.assertEqual(
+            workflow.format_processing_duration(3_665.9),
+            "1小时01分05秒",
+        )
+        self.assertEqual(
+            workflow.format_processing_duration(90_065.9),
+            "1天01小时01分05秒",
+        )
+
     def test_expand_inputs_expands_top_level_mkv_files_only(self) -> None:
         with tempfile.TemporaryDirectory(dir=Path.cwd()) as temp_dir:
             root = Path(temp_dir)

@@ -56,10 +56,16 @@ class DryRunRecord:
 
 
 def format_processing_duration(elapsed_seconds: float) -> str:
-    """将处理耗时格式化为累计分钟和两位秒数。"""
+    """根据耗时长度按分钟、小时或天显示。"""
 
     total_seconds = int(elapsed_seconds)
-    minutes, seconds = divmod(total_seconds, 60)
+    days, remaining_seconds = divmod(total_seconds, 24 * 60 * 60)
+    hours, remaining_seconds = divmod(remaining_seconds, 60 * 60)
+    minutes, seconds = divmod(remaining_seconds, 60)
+    if days:
+        return f"{days}天{hours:02d}小时{minutes:02d}分{seconds:02d}秒"
+    if hours:
+        return f"{hours}小时{minutes:02d}分{seconds:02d}秒"
     return f"{minutes}分{seconds:02d}秒"
 
 
