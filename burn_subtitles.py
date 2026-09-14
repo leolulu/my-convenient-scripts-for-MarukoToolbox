@@ -53,7 +53,7 @@ VIDEO_STREAM_RE = re.compile(r"^\s*Stream .+Video:", re.MULTILINE)
 AUDIO_STREAM_RE = re.compile(r"^\s*Stream .+Audio:", re.MULTILINE)
 AUDIO_STREAM_DETAILS_RE = re.compile(
     r"^\s*Stream #0:(?P<index>\d+)"
-    r"(?:\[[^\]\r\n]+\])?"
+    r"(?:\[(?P<track_number>[^\]\r\n]+)\])?"
     r"(?:\((?P<language>[^)\r\n]+)\))?"
     r":\s*Audio:(?P<details>.*)$",
     re.IGNORECASE | re.MULTILINE,
@@ -124,6 +124,13 @@ class AudioStream(NamedTuple):
     index: int
     language: str
     default: bool
+
+
+class AudioStreamDetails(NamedTuple):
+    track_number: int | None
+    codec: str
+    channels: str
+    name: str | None = None
 
 
 def positive_int(value: str) -> int:
@@ -339,6 +346,49 @@ def parse_audio_streams(probe_text: str) -> list[AudioStream]:
     return streams
 
 
+def parse_audio_stream_details(probe_text: str) -> dict[int, AudioStreamDetails]:
+    details = {}
+    for match in AUDIO_STREAM_DETAILS_RE.finditer(probe_text):
+        description = match.group("details")
+        parts = [part.strip() for part in description.split(",")]
+        codec = parts[0].strip() or "未知"
+        channels = next(
+            (
+                part for part in parts[1:]
+                if re.match(
+                    r"^(?:mono|stereo|\d+\.\d+(?:\([^)]*\))?|\d+\s*channels?)(?:$|\s)",
+                    part,
+                    re.IGNORECASE,
+                )
+            ),
+            "未知",
+        )
+        track_number_text = match.group("track_number")
+        try:
+            track_number = int(track_number_text, 0) if track_number_text else None
+        except ValueError:
+            track_number = None
+        following = probe_text[match.end():]
+        next_stream = re.search(
+            r"^[ \t]*(?:Stream #\d+:|Chapter #\d+:|Output #\d+:)",
+            following,
+            re.MULTILINE,
+        )
+        stream_metadata = following[:next_stream.start()] if next_stream else following
+        name_match = re.search(
+            r"^[ \t]*title[ \t]*:[ \t]*(.+?)[ \t]*$",
+            stream_metadata,
+            re.IGNORECASE | re.MULTILINE,
+        )
+        details[int(match.group("index"))] = AudioStreamDetails(
+            track_number,
+            codec,
+            channels,
+            name_match.group(1).strip() if name_match else None,
+        )
+    return details
+
+
 def matches_audio_language(language: str, preferred_language: str) -> bool:
     normalized = language.strip().lower().replace("_", "-")
     aliases = AUDIO_LANGUAGE_ALIASES[preferred_language]
@@ -502,6 +552,8 @@ def build_x264_color_options(color_info: VideoColorInfo) -> list[str]:
 
 def probe_video(
     video: Path,
+    *,
+    audio_details: dict[int, AudioStreamDetails] | None = None,
 ) -> tuple[
     float | None,
     bool,
@@ -518,6 +570,8 @@ def probe_video(
         check=False,
     )
     probe_text = result.stderr.decode("utf-8", errors="replace")
+    if audio_details is not None:
+        audio_details.update(parse_audio_stream_details(probe_text))
 
     video_line = next(
         (line for line in probe_text.splitlines() if VIDEO_STREAM_RE.search(line)),
@@ -873,6 +927,7 @@ def main(
     argv: Sequence[str] | None = None,
     *,
     result: list | None = None,
+    selected_audio_stream: AudioStream | None = None,
 ) -> int:
     args = build_parser().parse_args(argv)
     staged_fonts_dir: Path | None = None
@@ -899,10 +954,21 @@ def main(
         ) = probe_video(video)
         if not has_audio:
             fail("输入视频不包含音频流，当前脚本无法执行“压制音频”流程")
-        audio_stream, audio_selection = select_audio_stream(
-            audio_streams,
-            args.audio_language,
-        )
+        if selected_audio_stream is None:
+            audio_stream, audio_selection = select_audio_stream(
+                audio_streams,
+                args.audio_language,
+            )
+        else:
+            audio_stream = next(
+                (stream for stream in audio_streams if stream == selected_audio_stream),
+                None,
+            )
+            if audio_stream is None:
+                fail("手动选择的音轨在压制前复检时已不存在或信息发生变化")
+            audio_selection = (
+                f"手动选择流 0:{audio_stream.index}（语言 {audio_stream.language}）。"
+            )
         if result is not None:
             result.append(audio_stream)
 
@@ -919,10 +985,11 @@ def main(
             print(f"检测帧率：无法识别；使用指定的关键帧间隔：{keyint}")
         else:
             print(f"检测帧率：{frame_rate:g} fps；关键帧间隔：{keyint}")
-        print(
-            f"目标音轨语言：{AUDIO_LANGUAGE_NAMES[args.audio_language]}"
-            f"（{args.audio_language}）"
-        )
+        if selected_audio_stream is None:
+            print(
+                f"目标音轨语言：{AUDIO_LANGUAGE_NAMES[args.audio_language]}"
+                f"（{args.audio_language}）"
+            )
         print(f"音轨选择：{audio_selection}")
         print(
             "检测色彩："

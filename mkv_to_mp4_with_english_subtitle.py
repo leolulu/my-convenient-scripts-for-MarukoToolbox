@@ -20,6 +20,16 @@ class MkvToMp4Error(RuntimeError):
     """MKV 英文字幕烧录流程失败。"""
 
 
+class SkipCurrentFile(Exception):
+    """用户在交互选轨时主动跳过当前文件。"""
+
+
+class ExplicitAudioLanguage(argparse.Action):
+    def __call__(self, parser, namespace, values, option_string=None):
+        setattr(namespace, self.dest, values)
+        namespace.audio_language_explicit = True
+
+
 @dataclass(frozen=True)
 class DryRunResult:
     """单个 MKV 的字幕与音轨预检结果。"""
@@ -72,8 +82,8 @@ def format_processing_duration(elapsed_seconds: float) -> str:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "从 MKV 中按 enm→eng 选择一条英文字幕并提取，"
-            "然后复用小丸压制流程将字幕烧录到 MP4。"
+            "默认从 MKV 中按 enm→eng 选择一条英文字幕并提取；"
+            "使用 -i/--interactive 可手选字幕与音轨，然后烧录为 MP4。"
         )
     )
     parser.add_argument(
@@ -105,8 +115,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--audio-language",
         choices=burn.AUDIO_LANGUAGE_CHOICES,
         default="jpn",
+        action=ExplicitAudioLanguage,
         metavar="{jpn,eng}",
         help="多音轨时优先选择的语言：jpn=日语，eng=英语；默认 jpn",
+    )
+    parser.add_argument(
+        "-i",
+        "--interactive",
+        action="store_true",
+        help="逐个视频手动选择内嵌字幕轨和音轨，确认后再开始提取与压制",
     )
     parser.add_argument(
         "--keyint",
@@ -175,6 +192,137 @@ def select_english_subtitle(mkv: Path) -> dict:
             f"现有字幕语言：{', '.join(available) if available else '未知'}"
         )
     return track
+
+
+def read_interactive_input(prompt: str) -> str:
+    try:
+        return input(prompt).strip().lower()
+    except EOFError as error:
+        raise KeyboardInterrupt from error
+
+
+def prompt_track_number(label: str, count: int, selectable: set[int]) -> int:
+    while True:
+        answer = read_interactive_input(f"请选择{label}编号（q 跳过当前文件）：")
+        if answer == "q":
+            raise SkipCurrentFile
+        if answer.isdecimal():
+            number = int(answer)
+            if 1 <= number <= count and number in selectable:
+                return number - 1
+        print("输入无效或该轨道不可选，请输入可选编号。")
+
+
+def select_interactive_tracks(
+    mkv: Path, output: Path
+) -> tuple[dict, burn.AudioStream]:
+    tracks = extract.identify_tracks(mkv)
+    subtitle_tracks = [track for track in tracks if track.get("type") == "subtitles"]
+    if not subtitle_tracks:
+        fail("MKV 中没有字幕轨，流程提前结束")
+    selectable_subtitles = {
+        index
+        for index, track in enumerate(subtitle_tracks, start=1)
+        if str(track.get("properties", {}).get("codec_id", ""))
+        in extract.SUBTITLE_EXTENSIONS
+    }
+    if not selectable_subtitles:
+        fail("MKV 中没有当前脚本可提取的字幕轨，流程提前结束")
+
+    audio_details: dict[int, burn.AudioStreamDetails] = {}
+    _, has_audio, _, _, audio_streams = burn.probe_video(
+        mkv, audio_details=audio_details
+    )
+    if not has_audio:
+        fail("输入视频不包含音频流，当前脚本无法执行“压制音频”流程")
+    mkv_audio_tracks = [track for track in tracks if track.get("type") == "audio"]
+    if (
+        not audio_streams
+        or len(audio_streams) != len(mkv_audio_tracks)
+        or len({stream.index for stream in audio_streams}) != len(audio_streams)
+        or len(audio_details) != len(audio_streams)
+    ):
+        fail("无法完整识别音轨，交互模式无法安全地手动选择")
+
+    named_audio_tracks: dict[int, dict] = {}
+    ambiguous_track_numbers: set[int] = set()
+    for track in mkv_audio_tracks:
+        number = track.get("properties", {}).get("number")
+        try:
+            number = int(number)
+        except (TypeError, ValueError):
+            continue
+        if number in named_audio_tracks:
+            ambiguous_track_numbers.add(number)
+        else:
+            named_audio_tracks[number] = track
+    for number in ambiguous_track_numbers:
+        named_audio_tracks.pop(number)
+
+    while True:
+        print(f"\n内嵌字幕轨：共 {len(subtitle_tracks)} 条")
+        for index, track in enumerate(subtitle_tracks, start=1):
+            properties = track.get("properties", {})
+            language = str(properties.get("language") or "und").lower()
+            codec_id = str(properties.get("codec_id") or "未知")
+            if index not in selectable_subtitles:
+                availability = " | 不可选：当前脚本不支持提取"
+            elif codec_id not in {
+                "S_TEXT/UTF8", "S_TEXT/ASCII", "S_TEXT/ASS", "S_TEXT/SSA"
+            }:
+                availability = " | 提示：烧录兼容性未验证"
+            else:
+                availability = ""
+            print(
+                f"  [{index}] ID={track.get('id')} | "
+                f"语言={language}（{extract.describe_language(language)}） | "
+                f"名称={properties.get('track_name') or '未知'} | "
+                f"格式={track.get('codec') or '未知'}（{codec_id}） | "
+                f"默认={bool(properties.get('default_track', False))} | "
+                f"强制={bool(properties.get('forced_track', False))}"
+                f"{availability}"
+            )
+        subtitle_index = prompt_track_number(
+            "字幕轨", len(subtitle_tracks), selectable_subtitles
+        )
+        subtitle = subtitle_tracks[subtitle_index]
+
+        print(f"\n音轨：共 {len(audio_streams)} 条")
+        for index, stream in enumerate(audio_streams, start=1):
+            details = audio_details[stream.index]
+            named_track = named_audio_tracks.get(details.track_number, {})
+            name = (
+                details.name
+                or named_track.get("properties", {}).get("track_name")
+                or "未知"
+            )
+            print(
+                f"  [{index}] 流 0:{stream.index} | 语言={stream.language} | "
+                f"名称={name} | 编码={details.codec} | 声道={details.channels} | "
+                f"默认={stream.default}"
+            )
+        audio_index = prompt_track_number(
+            "音轨", len(audio_streams), set(range(1, len(audio_streams) + 1))
+        )
+        audio = audio_streams[audio_index]
+
+        print("\n选轨确认：")
+        print(
+            f"  字幕：ID {subtitle.get('id')}，"
+            f"语言 {subtitle.get('properties', {}).get('language') or 'und'}，"
+            f"名称 {subtitle.get('properties', {}).get('track_name') or '未知'}"
+        )
+        print(f"  音轨：流 0:{audio.index}，语言 {audio.language}")
+        print(f"  输出：{output}")
+        while True:
+            answer = read_interactive_input("确认选择（y 开始 / r 重选 / q 跳过）：")
+            if answer == "y":
+                return subtitle, audio
+            if answer == "r":
+                break
+            if answer == "q":
+                raise SkipCurrentFile
+            print("输入无效，请输入 y、r 或 q。")
 
 
 def prepare_subtitle_outputs(
@@ -394,17 +542,28 @@ def process_one(args: argparse.Namespace, mkv: Path) -> dict[str, object]:
     exported_subtitle: Path | None = None
     burn_subtitle_outputs: list[Path] = []
     fonts_dir: Path | None = None
+    interactive = getattr(args, "interactive", False)
+    selected_audio_stream: burn.AudioStream | None = None
     try:
         extract.validate_binaries()
 
-        print("========== 第 1 步：识别英文字幕 ==========")
-        print(f"输入文件：{mkv}")
-        track = select_english_subtitle(mkv)
+        if interactive:
+            print("========== 第 1 步：手动选择字幕与音轨 ==========")
+            print(f"输入文件：{mkv}")
+            burn.validate_binaries()
+            output = burn.resolve_output(mkv, args.output)
+            if output.exists() and not args.overwrite:
+                fail(f"输出 MP4 已经存在；如需覆盖，请添加 --overwrite：{output}")
+            track, selected_audio_stream = select_interactive_tracks(mkv, output)
+        else:
+            print("========== 第 1 步：识别英文字幕 ==========")
+            print(f"输入文件：{mkv}")
+            track = select_english_subtitle(mkv)
 
-        burn.validate_binaries()
-        output = burn.resolve_output(mkv, args.output)
-        if output.exists() and not args.overwrite:
-            fail(f"输出 MP4 已经存在；如需覆盖，请添加 --overwrite：{output}")
+            burn.validate_binaries()
+            output = burn.resolve_output(mkv, args.output)
+            if output.exists() and not args.overwrite:
+                fail(f"输出 MP4 已经存在；如需覆盖，请添加 --overwrite：{output}")
 
         properties = track.get("properties", {})
         print(
@@ -450,7 +609,14 @@ def process_one(args: argparse.Namespace, mkv: Path) -> dict[str, object]:
             fonts_dir,
         )
         result: list = []
-        burn_exit_code = burn.main(burn_arguments, result=result)
+        if interactive:
+            burn_exit_code = burn.main(
+                burn_arguments,
+                result=result,
+                selected_audio_stream=selected_audio_stream,
+            )
+        else:
+            burn_exit_code = burn.main(burn_arguments, result=result)
         if burn_exit_code == 130:
             raise KeyboardInterrupt
         if burn_exit_code != 0:
@@ -518,13 +684,15 @@ def describe_processing_error(error: BaseException) -> str:
 
 def print_interrupted_batch_summary(states: dict[Path, str]) -> None:
     """打印多文件批次在 Ctrl+C 时的最终状态。"""
-    groups = (
+    groups = [
         ("succeeded", "本次已完成"),
         ("skipped", "已有结果，已跳过"),
         ("failed", "处理失败"),
         ("interrupted", "当前被中断"),
         ("not_started", "尚未开始"),
-    )
+    ]
+    if "user_skipped" in states.values():
+        groups.insert(2, ("user_skipped", "用户主动跳过"))
     grouped = {
         status: [path for path, current in states.items() if current == status]
         for status, _label in groups
@@ -549,11 +717,19 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     batch_states: dict[Path, str] = {}
     try:
+        interactive = getattr(args, "interactive", False)
+        if interactive and args.dry_run:
+            fail("--interactive 不能与 --dry-run 同时使用")
+        if interactive and getattr(args, "audio_language_explicit", False):
+            fail("--interactive 不能与显式指定的 --audio-language 同时使用")
+        if interactive and not sys.stdin.isatty():
+            fail("--interactive 需要可交互的标准输入终端")
         mkvs = expand_inputs(args.inputs)
         batch_states = {mkv: "not_started" for mkv in mkvs}
         if args.output is not None and len(mkvs) != 1:
             fail("--output 仅支持单个 MKV 输入；批量或目录模式使用默认输出命名")
         processed_skipped = 0
+        user_skipped: list[Path] = []
         succeeded = 0
         failures: list[tuple[Path, str]] = []
         succeeded_records: list[dict[str, object]] = []
@@ -603,6 +779,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                     batch_states[mkv] = "skipped"
                     continue
                 record = process_one(args, mkv)
+            except SkipCurrentFile:
+                user_skipped.append(mkv)
+                batch_states[mkv] = "user_skipped"
+                print(f"用户主动跳过：{mkv}")
+                continue
             except (MkvToMp4Error, extract.ExtractSubtitleError, OSError) as error:
                 reason = describe_processing_error(error)
                 failures.append((mkv, reason))
@@ -623,12 +804,24 @@ def main(argv: Sequence[str] | None = None) -> int:
         processing_duration = format_processing_duration(
             time.monotonic() - processing_started_at
         )
-        print(
-            f"\n全部处理结束：共 {len(mkvs)} 个输入，"
-            f"跳过 {processed_skipped} 个已处理，成功 {succeeded} 个，"
-            f"失败 {len(failures)} 个。"
-        )
+        if interactive:
+            print(
+                f"\n全部处理结束：共 {len(mkvs)} 个输入，"
+                f"跳过 {processed_skipped} 个已处理，"
+                f"用户主动跳过 {len(user_skipped)} 个，"
+                f"成功 {succeeded} 个，失败 {len(failures)} 个。"
+            )
+        else:
+            print(
+                f"\n全部处理结束：共 {len(mkvs)} 个输入，"
+                f"跳过 {processed_skipped} 个已处理，成功 {succeeded} 个，"
+                f"失败 {len(failures)} 个。"
+            )
         print(f"总处理时间：{processing_duration}")
+        if user_skipped:
+            print("\n用户主动跳过明细：")
+            for mkv in user_skipped:
+                print(f"  - {mkv}")
         if succeeded_records:
             print("\n成功明细：")
             for record in succeeded_records:
