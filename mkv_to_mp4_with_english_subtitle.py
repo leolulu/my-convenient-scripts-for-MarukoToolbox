@@ -65,6 +65,14 @@ class DryRunRecord:
         return self.status_failure is not None or self.result.failed
 
 
+@dataclass(frozen=True)
+class InteractiveSelection:
+    """交互阶段为单个文件确认的字幕与音轨。"""
+
+    subtitle: dict
+    audio: burn.AudioStream
+
+
 def format_processing_duration(elapsed_seconds: float) -> str:
     """根据耗时长度按分钟、小时或天显示。"""
 
@@ -123,7 +131,7 @@ def build_parser() -> argparse.ArgumentParser:
         "-i",
         "--interactive",
         action="store_true",
-        help="逐个视频手动选择内嵌字幕轨和音轨，确认后再开始提取与压制",
+        help="先为所有视频手动选择字幕轨和音轨，全部确认后再依次提取与压制",
     )
     parser.add_argument(
         "--keyint",
@@ -533,7 +541,26 @@ def print_dry_run_summary(records: list[DryRunRecord]) -> None:
         print(f"  {label}：{count}")
 
 
-def process_one(args: argparse.Namespace, mkv: Path) -> dict[str, object]:
+def prepare_interactive_selection(
+    args: argparse.Namespace, mkv: Path
+) -> InteractiveSelection:
+    """校验单个输入并完成选轨，不执行字幕提取或视频压制。"""
+    print("========== 手动选择字幕与音轨 ==========")
+    print(f"输入文件：{mkv}")
+    extract.validate_binaries()
+    burn.validate_binaries()
+    output = burn.resolve_output(mkv, args.output)
+    if output.exists() and not args.overwrite:
+        fail(f"输出 MP4 已经存在；如需覆盖，请添加 --overwrite：{output}")
+    subtitle, audio = select_interactive_tracks(mkv, output)
+    return InteractiveSelection(subtitle, audio)
+
+
+def process_one(
+    args: argparse.Namespace,
+    mkv: Path,
+    interactive_selection: InteractiveSelection | None = None,
+) -> dict[str, object]:
     """对单个 MKV 执行完整的识别→提取→烧录流程；失败抛 MkvToMp4Error/ExtractSubtitleError。
 
     成功返回记录：{"mkv", "audio": burn.AudioStream|None, "subtitle": track dict}。
@@ -548,13 +575,17 @@ def process_one(args: argparse.Namespace, mkv: Path) -> dict[str, object]:
         extract.validate_binaries()
 
         if interactive:
-            print("========== 第 1 步：手动选择字幕与音轨 ==========")
+            if interactive_selection is None:
+                interactive_selection = prepare_interactive_selection(args, mkv)
+            else:
+                burn.validate_binaries()
+                output = burn.resolve_output(mkv, args.output)
+                if output.exists() and not args.overwrite:
+                    fail(f"输出 MP4 已经存在；如需覆盖，请添加 --overwrite：{output}")
+            print("========== 第 1 步：使用已确认的字幕与音轨 ==========")
             print(f"输入文件：{mkv}")
-            burn.validate_binaries()
-            output = burn.resolve_output(mkv, args.output)
-            if output.exists() and not args.overwrite:
-                fail(f"输出 MP4 已经存在；如需覆盖，请添加 --overwrite：{output}")
-            track, selected_audio_stream = select_interactive_tracks(mkv, output)
+            track = interactive_selection.subtitle
+            selected_audio_stream = interactive_selection.audio
         else:
             print("========== 第 1 步：识别英文字幕 ==========")
             print(f"输入文件：{mkv}")
@@ -734,6 +765,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         failures: list[tuple[Path, str]] = []
         succeeded_records: list[dict[str, object]] = []
         dry_run_records: list[DryRunRecord] = []
+        interactive_selections: dict[Path, InteractiveSelection] = {}
         processing_started_at = time.monotonic() if not args.dry_run else None
         if args.dry_run:
             audio_pref = burn.AUDIO_LANGUAGE_NAMES[args.audio_language]
@@ -741,12 +773,54 @@ def main(argv: Sequence[str] | None = None) -> int:
                 f"Dry-run 预检：{len(mkvs)} 个输入"
                 f"（字幕按内建 enm→eng，音轨偏好={audio_pref} {args.audio_language}）"
             )
+        if interactive:
+            print(f"\n========== 选轨阶段：共 {len(mkvs)} 个输入 ==========")
+            for index, mkv in enumerate(mkvs, start=1):
+                batch_states[mkv] = "interrupted"
+                print(f"\n========== 选择 {index}/{len(mkvs)}：{mkv} ==========")
+                try:
+                    already_processed = has_processed_output(mkv, args)
+                    if already_processed and not args.overwrite:
+                        print(f"已处理过，跳过：{mkv}")
+                        processed_skipped += 1
+                        batch_states[mkv] = "skipped"
+                        continue
+                    interactive_selections[mkv] = prepare_interactive_selection(args, mkv)
+                    batch_states[mkv] = "not_started"
+                except SkipCurrentFile:
+                    user_skipped.append(mkv)
+                    batch_states[mkv] = "user_skipped"
+                    print(f"用户主动跳过：{mkv}")
+                except (MkvToMp4Error, extract.ExtractSubtitleError, OSError) as error:
+                    reason = describe_processing_error(error)
+                    failures.append((mkv, reason))
+                    batch_states[mkv] = "failed"
+                    print(f"选轨失败：{mkv}", file=sys.stderr)
+                    print(f"原因：{reason}", file=sys.stderr)
+            print(
+                f"\n选轨阶段完成：已确认 {len(interactive_selections)} 个文件。"
+                "现在开始依次转换，无需继续操作。"
+            )
+        conversion_index = 0
         for index, mkv in enumerate(mkvs, start=1):
+            if interactive and mkv not in interactive_selections:
+                continue
+            if interactive:
+                conversion_index += 1
+                display_index = conversion_index
+                display_total = len(interactive_selections)
+            else:
+                display_index = index
+                display_total = len(mkvs)
             if not args.dry_run:
                 batch_states[mkv] = "interrupted"
                 file_started_at = time.monotonic()
             if not args.dry_run:
-                print(f"\n========== 处理 {index}/{len(mkvs)}：{mkv} ==========")
+                action = "转换" if interactive else "处理"
+                print(
+                    f"\n========== {action} {display_index}/{display_total}："
+                    f"{mkv} =========="
+                )
             try:
                 if args.dry_run:
                     status_failure = None
@@ -772,13 +846,16 @@ def main(argv: Sequence[str] | None = None) -> int:
                     print(f"    字幕：{result.subtitle_line}")
                     print(f"    音轨：{result.audio_line}")
                     continue
-                already_processed = has_processed_output(mkv, args)
-                if already_processed and not args.overwrite:
-                    print(f"已处理过，跳过：{mkv}")
-                    processed_skipped += 1
-                    batch_states[mkv] = "skipped"
-                    continue
-                record = process_one(args, mkv)
+                if interactive:
+                    record = process_one(args, mkv, interactive_selections[mkv])
+                else:
+                    already_processed = has_processed_output(mkv, args)
+                    if already_processed and not args.overwrite:
+                        print(f"已处理过，跳过：{mkv}")
+                        processed_skipped += 1
+                        batch_states[mkv] = "skipped"
+                        continue
+                    record = process_one(args, mkv)
             except SkipCurrentFile:
                 user_skipped.append(mkv)
                 batch_states[mkv] = "user_skipped"

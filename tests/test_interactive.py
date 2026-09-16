@@ -199,11 +199,15 @@ class InteractiveCommandTests(unittest.TestCase):
             for mkv in mkvs:
                 mkv.touch()
             output = io.StringIO()
+            selection = workflow.InteractiveSelection(SUBTITLES[0], AUDIO[0])
             with (
                 mock.patch.object(workflow, "expand_inputs", return_value=mkvs),
                 mock.patch.object(workflow, "has_processed_output", return_value=False),
-                mock.patch.object(workflow, "process_one", side_effect=[
+                mock.patch.object(workflow, "prepare_interactive_selection", side_effect=[
                     workflow.SkipCurrentFile,
+                    selection,
+                ]),
+                mock.patch.object(workflow, "process_one", side_effect=[
                     {"mkv": mkvs[1], "audio": AUDIO[0], "subtitle": SUBTITLES[0]},
                 ]),
                 mock.patch.object(workflow.sys, "stdin", mock.Mock(isatty=lambda: True)),
@@ -223,11 +227,13 @@ class InteractiveCommandTests(unittest.TestCase):
             output = io.StringIO()
             with (
                 mock.patch.object(workflow, "has_processed_output", return_value=True),
+                mock.patch.object(workflow, "prepare_interactive_selection") as select,
                 mock.patch.object(workflow, "process_one") as process,
                 mock.patch.object(workflow.sys, "stdin", mock.Mock(isatty=lambda: True)),
                 redirect_stdout(output),
             ):
                 self.assertEqual(workflow.main([str(mkv), "--interactive"]), 0)
+            select.assert_not_called()
             process.assert_not_called()
             self.assertIn("跳过 1 个已处理", output.getvalue())
 
@@ -238,7 +244,12 @@ class InteractiveCommandTests(unittest.TestCase):
             with (
                 mock.patch.object(workflow, "expand_inputs", return_value=mkvs),
                 mock.patch.object(workflow, "has_processed_output", return_value=False),
-                mock.patch.object(workflow, "process_one", side_effect=lambda *_: workflow.read_interactive_input("选轨：")),
+                mock.patch.object(
+                    workflow,
+                    "prepare_interactive_selection",
+                    side_effect=lambda *_: workflow.read_interactive_input("选轨："),
+                ),
+                mock.patch.object(workflow, "process_one") as process,
                 mock.patch("builtins.input", side_effect=EOFError),
                 mock.patch.object(workflow.sys, "stdin", mock.Mock(isatty=lambda: True)),
                 redirect_stdout(io.StringIO()),
@@ -246,8 +257,41 @@ class InteractiveCommandTests(unittest.TestCase):
             ):
                 exit_code = workflow.main([directory, "--interactive"])
         self.assertEqual(exit_code, 130)
+        process.assert_not_called()
         self.assertIn("当前被中断 1 个", error_output.getvalue())
         self.assertIn("尚未开始 1 个", error_output.getvalue())
+
+    def test_all_files_are_selected_before_first_conversion(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            mkvs = [Path(directory) / "a.mkv", Path(directory) / "b.mkv"]
+            for mkv in mkvs:
+                mkv.touch()
+            events: list[str] = []
+
+            def select(_args, mkv):
+                events.append(f"select:{mkv.name}")
+                return workflow.InteractiveSelection(SUBTITLES[0], AUDIO[0])
+
+            def process(_args, mkv, selection):
+                self.assertEqual(selection.audio, AUDIO[0])
+                events.append(f"convert:{mkv.name}")
+                return {"mkv": mkv, "audio": AUDIO[0], "subtitle": SUBTITLES[0]}
+
+            with (
+                mock.patch.object(workflow, "expand_inputs", return_value=mkvs),
+                mock.patch.object(workflow, "has_processed_output", return_value=False),
+                mock.patch.object(workflow, "prepare_interactive_selection", side_effect=select),
+                mock.patch.object(workflow, "process_one", side_effect=process),
+                mock.patch.object(workflow.sys, "stdin", mock.Mock(isatty=lambda: True)),
+                redirect_stdout(io.StringIO()),
+            ):
+                exit_code = workflow.main([directory, "--interactive"])
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(
+            events,
+            ["select:a.mkv", "select:b.mkv", "convert:a.mkv", "convert:b.mkv"],
+        )
 
     def test_process_one_passes_exact_manual_audio_stream(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -270,7 +314,6 @@ class InteractiveCommandTests(unittest.TestCase):
                 mock.patch.object(extract, "validate_binaries"),
                 mock.patch.object(burn, "validate_binaries"),
                 mock.patch.object(burn, "resolve_output", return_value=output),
-                mock.patch.object(workflow, "select_interactive_tracks", return_value=(SUBTITLES[0], AUDIO[1])),
                 mock.patch.object(workflow, "prepare_subtitle_outputs", return_value=(temp_subtitle, None, [temp_subtitle])),
                 mock.patch.object(extract, "extract_subtitle"),
                 mock.patch.object(workflow, "prepare_font_directory", return_value=None),
@@ -278,7 +321,11 @@ class InteractiveCommandTests(unittest.TestCase):
                 mock.patch.object(extract, "remove_outputs"),
                 redirect_stdout(io.StringIO()),
             ):
-                record = workflow.process_one(args, mkv)
+                record = workflow.process_one(
+                    args,
+                    mkv,
+                    workflow.InteractiveSelection(SUBTITLES[0], AUDIO[1]),
+                )
 
         self.assertEqual(record["audio"], AUDIO[1])
 
