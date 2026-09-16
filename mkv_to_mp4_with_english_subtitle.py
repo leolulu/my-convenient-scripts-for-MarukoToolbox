@@ -276,7 +276,11 @@ def select_interactive_tracks(
             if index not in selectable_subtitles:
                 availability = " | 不可选：当前脚本不支持提取"
             elif codec_id not in {
-                "S_TEXT/UTF8", "S_TEXT/ASCII", "S_TEXT/ASS", "S_TEXT/SSA"
+                "S_TEXT/UTF8",
+                "S_TEXT/ASCII",
+                "S_TEXT/ASS",
+                "S_TEXT/SSA",
+                "S_HDMV/PGS",
             }:
                 availability = " | 提示：烧录兼容性未验证"
             else:

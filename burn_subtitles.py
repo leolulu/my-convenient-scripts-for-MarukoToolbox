@@ -744,7 +744,9 @@ def encode_video(
     color_info: VideoColorInfo | None = None,
 ) -> None:
     use_fonts_pipeline = fonts_dir is not None and subtitle.suffix.lower() == ".ass"
-    use_y4m_pipeline = fallback_ffmpeg is not None or use_fonts_pipeline
+    use_pgs_pipeline = subtitle.suffix.lower() == ".sup"
+    use_ffmpeg_subtitle_pipeline = use_fonts_pipeline or use_pgs_pipeline
+    use_y4m_pipeline = fallback_ffmpeg is not None or use_ffmpeg_subtitle_pipeline
     x264_command = [
         X264,
         "--crf",
@@ -776,11 +778,11 @@ def encode_video(
     ]
     if use_y4m_pipeline and color_info is not None:
         x264_command.extend(build_x264_color_options(color_info))
-    if not use_fonts_pipeline:
+    if not use_ffmpeg_subtitle_pipeline:
         x264_command.extend(("--vf", "subtitles", "--sub", subtitle))
     x264_command.extend(("-o", video_temp))
 
-    if fallback_ffmpeg is None and not use_fonts_pipeline:
+    if fallback_ffmpeg is None and not use_ffmpeg_subtitle_pipeline:
         x264_command.append(video)
         run_command(x264_command, "烧录字幕并压制视频")
         return
@@ -793,19 +795,26 @@ def encode_video(
         "-nostdin",
     ]
     if use_fonts_pipeline:
-        assert fonts_dir is not None
         decoder_command.extend(("-copyts", "-start_at_zero"))
-    decoder_command.extend(
-        (
-            "-i",
-            video,
-            "-map",
-            "0:v:0",
-            "-an",
-            "-sn",
+    elif use_pgs_pipeline:
+        decoder_command.append("-copyts")
+    decoder_command.extend(("-i", video))
+    if use_pgs_pipeline:
+        decoder_command.extend(
+            (
+                "-i",
+                subtitle,
+                "-filter_complex",
+                "[0:v:0][1:s:0]overlay=eof_action=pass:repeatlast=0[v]",
+                "-map",
+                "[v]",
+            )
         )
-    )
+    else:
+        decoder_command.extend(("-map", "0:v:0"))
+    decoder_command.extend(("-an", "-sn"))
     if use_fonts_pipeline:
+        assert fonts_dir is not None
         decoder_command.extend(
             ("-vf", build_subtitles_filter(subtitle, fonts_dir))
         )
@@ -820,11 +829,12 @@ def encode_video(
     )
     x264_command.extend(("--demuxer", "y4m", "-"))
 
-    stage = (
-        "ffmpeg 烧录 ASS 字幕、x264 压制视频"
-        if use_fonts_pipeline
-        else "外部解码、烧录字幕并压制视频"
-    )
+    if use_fonts_pipeline:
+        stage = "ffmpeg 烧录 ASS 字幕、x264 压制视频"
+    elif use_pgs_pipeline:
+        stage = "ffmpeg 烧录 PGS 字幕、x264 压制视频"
+    else:
+        stage = "外部解码、烧录字幕并压制视频"
     print(
         f"\n[{stage}]\n{display_command(decoder_command)}"
         f" | {display_command(x264_command)}",

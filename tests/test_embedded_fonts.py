@@ -310,6 +310,65 @@ class BurnFontsPipelineTests(unittest.TestCase):
             self.assertNotIn("--colorprim", command)
             self.assertEqual(command[-1], video)
 
+    def test_pgs_uses_ffmpeg_overlay_and_x264_y4m(self) -> None:
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as temp_dir:
+            root = Path(temp_dir)
+            video = root / "sample.mkv"
+            subtitle = root / "sample.sup"
+            output = root / "video.mp4"
+
+            decoder_process = FakeProcess(
+                stdout=io.BytesIO(
+                    b"YUV4MPEG2 W16 H16 F24:1 Ip A1:1 C420jpeg\nFRAME\n"
+                )
+            )
+            x264_process = FakeProcess(stdin=io.BytesIO())
+
+            with mock.patch.object(
+                burn,
+                "start_process",
+                side_effect=[decoder_process, x264_process],
+            ) as popen:
+                burn.encode_video(
+                    video,
+                    subtitle,
+                    output,
+                    24.0,
+                    240,
+                    None,
+                    color_info=BT709_LIMITED,
+                )
+
+            decoder_command = popen.call_args_list[0].args[0]
+            x264_command = popen.call_args_list[1].args[0]
+            self.assertEqual(decoder_command[0], burn.FFMPEG)
+            self.assertIn("-copyts", decoder_command)
+            self.assertNotIn("-start_at_zero", decoder_command)
+            self.assertEqual(decoder_command.count("-i"), 2)
+            input_positions = [
+                index
+                for index, argument in enumerate(decoder_command)
+                if argument == "-i"
+            ]
+            self.assertEqual(
+                [decoder_command[index + 1] for index in input_positions],
+                [video, subtitle],
+            )
+            self.assertIn("-filter_complex", decoder_command)
+            self.assertEqual(
+                decoder_command[decoder_command.index("-filter_complex") + 1],
+                "[0:v:0][1:s:0]overlay=eof_action=pass:repeatlast=0[v]",
+            )
+            self.assertEqual(
+                decoder_command[decoder_command.index("-map") + 1],
+                "[v]",
+            )
+            self.assertNotIn("-vf", decoder_command)
+            self.assertNotIn("--vf", x264_command)
+            self.assertNotIn("--sub", x264_command)
+            self.assertIn("--range", x264_command)
+            self.assertEqual(x264_command[-3:], ["--demuxer", "y4m", "-"])
+
 
 class WorkflowFontCleanupTests(unittest.TestCase):
     def test_font_directory_is_removed_when_burn_fails(self) -> None:

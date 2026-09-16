@@ -84,10 +84,17 @@ class InteractiveSelectionTests(unittest.TestCase):
         self.assertEqual(audio, AUDIO[1])
         self.assertIn("Japanese Full", output)
         self.assertIn("不可选：当前脚本不支持提取", output)
-        self.assertIn("烧录兼容性未验证", output)
+        self.assertNotIn("烧录兼容性未验证", output)
         self.assertIn("Commentary", output)
         self.assertIn("编码=ac3 | 声道=5.1(side)", output)
         self.assertIn("输出：sample_x264.mp4", output)
+
+    def test_menu_allows_pgs_without_compatibility_warning(self) -> None:
+        (subtitle, audio), output = self.select(["2", "1", "y"])
+
+        self.assertEqual(subtitle["id"], 3)
+        self.assertEqual(audio, AUDIO[0])
+        self.assertNotIn("烧录兼容性未验证", output)
 
     def test_invalid_or_disabled_selection_reprompts_then_can_reselect(self) -> None:
         (subtitle, audio), output = self.select(["3", "", "2", "1", "r", "1", "2", "y"])
