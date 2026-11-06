@@ -22,6 +22,7 @@ from graceful_stop import (
     stop_processes,
     wait_process,
 )
+from pgs_subtitle import PgsSubtitleError, normalize_sup_file
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -805,7 +806,8 @@ def encode_video(
                 "-i",
                 subtitle,
                 "-filter_complex",
-                "[0:v:0][1:s:0]overlay=eof_action=pass:repeatlast=0[v]",
+                "[1:s:0][0:v:0]scale2ref[pgs][main];"
+                "[main][pgs]overlay=eof_action=pass:repeatlast=0[v]",
                 "-map",
                 "[v]",
             )
@@ -922,6 +924,7 @@ def cleanup_media_temp_files(
     video_temp: Path,
     audio_temp: Path,
     *,
+    subtitle_temp: Path | None = None,
     keep_temp: bool,
     cancelled: bool,
 ) -> None:
@@ -929,7 +932,13 @@ def cleanup_media_temp_files(
     if cancelled or not keep_temp:
         remove_file(video_temp)
         remove_file(audio_temp)
-    elif audio_temp.exists() or video_temp.exists():
+        if subtitle_temp is not None:
+            remove_file(subtitle_temp)
+    elif (
+        audio_temp.exists()
+        or video_temp.exists()
+        or (subtitle_temp is not None and subtitle_temp.exists())
+    ):
         print(f"\n已保留中间文件：{TEMP_DIR}")
 
 
@@ -1019,11 +1028,22 @@ def main(
         temp_id = f"burn_subtitles_{os.getpid()}_{uuid.uuid4().hex[:8]}"
         audio_temp = TEMP_DIR / f"{temp_id}_atemp.mp4"
         video_temp = TEMP_DIR / f"{temp_id}_vtemp.mp4"
-
+        subtitle_temp: Path | None = None
         completed = False
         cancelled = False
         mux_started = False
         try:
+            if subtitle.suffix.lower() == ".sup":
+                normalized_sup = TEMP_DIR / f"{temp_id}_subtitle.sup"
+                subtitle_temp = normalized_sup
+                try:
+                    cropped_objects = normalize_sup_file(subtitle, normalized_sup)
+                except PgsSubtitleError as error:
+                    fail(f"SUP 字幕预处理失败：{error}")
+                if cropped_objects:
+                    subtitle = normalized_sup
+                    print(f"SUP 预处理：已应用 {cropped_objects} 处对象裁剪")
+
             encode_audio(video, audio_temp, args.audio_bitrate, audio_stream)
             encode_video(
                 video,
@@ -1048,6 +1068,7 @@ def main(
             cleanup_media_temp_files(
                 video_temp,
                 audio_temp,
+                subtitle_temp=subtitle_temp,
                 keep_temp=args.keep_temp,
                 cancelled=cancelled,
             )

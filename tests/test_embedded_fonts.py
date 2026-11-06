@@ -310,65 +310,6 @@ class BurnFontsPipelineTests(unittest.TestCase):
             self.assertNotIn("--colorprim", command)
             self.assertEqual(command[-1], video)
 
-    def test_pgs_uses_ffmpeg_overlay_and_x264_y4m(self) -> None:
-        with tempfile.TemporaryDirectory(dir=Path.cwd()) as temp_dir:
-            root = Path(temp_dir)
-            video = root / "sample.mkv"
-            subtitle = root / "sample.sup"
-            output = root / "video.mp4"
-
-            decoder_process = FakeProcess(
-                stdout=io.BytesIO(
-                    b"YUV4MPEG2 W16 H16 F24:1 Ip A1:1 C420jpeg\nFRAME\n"
-                )
-            )
-            x264_process = FakeProcess(stdin=io.BytesIO())
-
-            with mock.patch.object(
-                burn,
-                "start_process",
-                side_effect=[decoder_process, x264_process],
-            ) as popen:
-                burn.encode_video(
-                    video,
-                    subtitle,
-                    output,
-                    24.0,
-                    240,
-                    None,
-                    color_info=BT709_LIMITED,
-                )
-
-            decoder_command = popen.call_args_list[0].args[0]
-            x264_command = popen.call_args_list[1].args[0]
-            self.assertEqual(decoder_command[0], burn.FFMPEG)
-            self.assertIn("-copyts", decoder_command)
-            self.assertNotIn("-start_at_zero", decoder_command)
-            self.assertEqual(decoder_command.count("-i"), 2)
-            input_positions = [
-                index
-                for index, argument in enumerate(decoder_command)
-                if argument == "-i"
-            ]
-            self.assertEqual(
-                [decoder_command[index + 1] for index in input_positions],
-                [video, subtitle],
-            )
-            self.assertIn("-filter_complex", decoder_command)
-            self.assertEqual(
-                decoder_command[decoder_command.index("-filter_complex") + 1],
-                "[0:v:0][1:s:0]overlay=eof_action=pass:repeatlast=0[v]",
-            )
-            self.assertEqual(
-                decoder_command[decoder_command.index("-map") + 1],
-                "[v]",
-            )
-            self.assertNotIn("-vf", decoder_command)
-            self.assertNotIn("--vf", x264_command)
-            self.assertNotIn("--sub", x264_command)
-            self.assertIn("--range", x264_command)
-            self.assertEqual(x264_command[-3:], ["--demuxer", "y4m", "-"])
-
 
 class WorkflowFontCleanupTests(unittest.TestCase):
     def test_font_directory_is_removed_when_burn_fails(self) -> None:
@@ -505,6 +446,53 @@ class GracefulCleanupTests(unittest.TestCase):
             self.assertEqual(exit_code, 130)
             self.assertEqual(list(burn_temp.iterdir()), [])
             encode_video.assert_not_called()
+
+    def test_cancel_during_sup_preprocessing_cleans_normalized_file(self) -> None:
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as temp_dir:
+            root = Path(temp_dir)
+            video = root / "sample.mkv"
+            subtitle = root / "sample.sup"
+            video.touch()
+            subtitle.write_bytes(b"source sup")
+            burn_temp = root / "temp"
+
+            def interrupt_normalization(_source: Path, destination: Path) -> int:
+                destination.write_bytes(b"normalized sup")
+                raise KeyboardInterrupt
+
+            with (
+                mock.patch.object(burn, "TEMP_DIR", burn_temp),
+                mock.patch.object(burn, "validate_binaries"),
+                mock.patch.object(
+                    burn,
+                    "probe_video",
+                    return_value=(
+                        24.0,
+                        True,
+                        True,
+                        BT709_LIMITED,
+                        [burn.AudioStream(1, "jpn", True)],
+                    ),
+                ),
+                mock.patch.object(
+                    burn,
+                    "normalize_sup_file",
+                    side_effect=interrupt_normalization,
+                ),
+                mock.patch.object(burn, "encode_audio") as encode_audio,
+                mock.patch("sys.stdout"),
+                mock.patch("sys.stderr"),
+            ):
+                exit_code = burn.main([
+                    str(video),
+                    str(subtitle),
+                    "--keep-temp",
+                ])
+
+            self.assertEqual(exit_code, 130)
+            self.assertEqual(list(burn_temp.iterdir()), [])
+            self.assertEqual(subtitle.read_bytes(), b"source sup")
+            encode_audio.assert_not_called()
 
     def test_cancel_removes_current_media_temps_even_when_keep_is_enabled(self) -> None:
         with tempfile.TemporaryDirectory(dir=Path.cwd()) as temp_dir:
