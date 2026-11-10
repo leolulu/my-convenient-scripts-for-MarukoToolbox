@@ -285,6 +285,29 @@ def resolve_output(video: Path, output: Path | None) -> Path:
     return resolved
 
 
+def validate_mp4box_output_path(output: Path) -> None:
+    """在压制前检查小丸自带的 MP4Box 能否使用输出路径。"""
+    if os.name != "nt":
+        return
+
+    path = str(output)
+    ansi_path = path.encode("mbcs", errors="replace").decode("mbcs", errors="replace")
+    if ansi_path != path:
+        reason = f"MP4Box 按 Windows ANSI 代码页读取时会得到 {ansi_path}"
+    elif re.search(r'[<>:"|?*\x00-\x1f]', output.name):
+        reason = "文件名包含 Windows 保留字符"
+    elif not path.startswith("\\\\?\\") and len(path.encode("utf-16-le")) // 2 >= 260:
+        reason = "未带长路径前缀的输出路径达到 260 字符"
+    else:
+        return
+
+    fail(
+        f"MP4Box 输出路径不可用：{output}\n"
+        f"{reason}。\n"
+        "请修改相关目录名或文件名。单文件可用 -o 指定较短的纯 ASCII 输出路径。"
+    )
+
+
 def validate_binaries() -> None:
     missing = [
         path
@@ -955,14 +978,16 @@ def main(
         validate_binaries()
         video = resolve_input(args.video, "输入视频")
         subtitle = resolve_input(args.subtitle, "字幕文件")
-        fonts_dir = resolve_fonts_dir(args.fonts_dir)
-        if fonts_dir is not None and subtitle.suffix.lower() != ".ass":
-            fail("--fonts-dir 仅支持与 ASS 字幕一起使用")
-        fonts_dir, staged_fonts_dir = prepare_ffmpeg_fonts_dir(fonts_dir)
         output = resolve_output(video, args.output)
 
         if output.exists() and not args.overwrite:
             fail(f"输出文件已经存在；如需覆盖，请添加 --overwrite：{output}")
+        validate_mp4box_output_path(output)
+
+        fonts_dir = resolve_fonts_dir(args.fonts_dir)
+        if fonts_dir is not None and subtitle.suffix.lower() != ".ass":
+            fail("--fonts-dir 仅支持与 ASS 字幕一起使用")
+        fonts_dir, staged_fonts_dir = prepare_ffmpeg_fonts_dir(fonts_dir)
 
         (
             frame_rate,

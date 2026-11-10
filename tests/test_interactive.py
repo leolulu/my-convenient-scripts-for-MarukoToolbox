@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import io
+import os
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
@@ -299,6 +300,57 @@ class InteractiveCommandTests(unittest.TestCase):
             events,
             ["select:a.mkv", "select:b.mkv", "convert:a.mkv", "convert:b.mkv"],
         )
+
+    @unittest.skipUnless(os.name == "nt", "需要 Windows ANSI 代码页")
+    def test_bad_output_path_aborts_batch_before_selection_or_conversion(self) -> None:
+        icon = "\uf07c"
+        if icon.encode("mbcs", errors="replace").decode("mbcs") == icon:
+            self.skipTest("当前 ANSI 代码页支持这个字符")
+
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as directory:
+            root = Path(directory)
+            valid = root / "a.mkv"
+            valid.touch()
+            invalid = root / f"folder {icon}" / "b.mkv"
+            invalid.parent.mkdir()
+            invalid.touch()
+            remaining = root / "c.mkv"
+            remaining.touch()
+
+            for flags in ([], ["-i"]):
+                with self.subTest(flags=flags):
+                    output = io.StringIO()
+                    with (
+                        mock.patch.object(workflow.sys, "stdin", mock.Mock(isatty=lambda: True)),
+                        mock.patch.object(
+                            workflow,
+                            "has_processed_output",
+                            wraps=workflow.has_processed_output,
+                        ) as preflight,
+                        mock.patch.object(workflow, "prepare_interactive_selection") as select,
+                        mock.patch.object(workflow, "process_one") as process,
+                        redirect_stdout(output),
+                        redirect_stderr(output),
+                    ):
+                        exit_code = workflow.main(
+                            [str(valid), str(invalid), str(remaining), *flags]
+                        )
+
+                    self.assertEqual(exit_code, 1)
+                    self.assertEqual(
+                        preflight.call_args_list,
+                        [
+                            mock.call(valid.resolve(), mock.ANY),
+                            mock.call(invalid.resolve(), mock.ANY),
+                        ],
+                    )
+                    select.assert_not_called()
+                    process.assert_not_called()
+                    log = output.getvalue()
+                    self.assertIn("输出路径检查失败，已终止本次转换", log)
+                    self.assertIn(str(invalid.resolve()), log)
+                    self.assertIn("Windows ANSI 代码页", log)
+                    self.assertIn("-o", log)
 
     def test_process_one_passes_exact_manual_audio_stream(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
